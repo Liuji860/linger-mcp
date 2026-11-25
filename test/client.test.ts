@@ -17,6 +17,8 @@ test("LingerClient login, 0600 cache, /v0/me 401 recovery, concurrent 401 safety
   let loginCalls = 0;
   let activeCookie = "cookie_v1";
   let force401Once = true;
+  let force401OnDownloadOnce = true;
+  let return202Once = true;
   let forceConcurrent401 = false;
   let return429OnRooms = false;
   let tamperIdentity = false;
@@ -121,6 +123,70 @@ test("LingerClient login, 0600 cache, /v0/me 401 recovery, concurrent 401 safety
       return;
     }
 
+    if (req.method === "GET" && url === "/v0/documents/doc_1") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          id: "doc_1",
+          tenant_id: "tenant_1",
+          title: "调研报告",
+          format: "native",
+          representation_format: "markdown",
+          status: "active",
+          current_version: null,
+          draft_capability: "read",
+          can_edit_native_content: true,
+          capabilities: {
+            read: true,
+            write: false,
+            manage: false,
+            delete: false,
+            duplicate: true,
+            export: true,
+            comment: true,
+            use_as_context: true,
+          },
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+      );
+      return;
+    }
+
+    if (req.method === "GET" && url === "/v0/documents/doc_1/downloads") {
+      if (force401OnDownloadOnce) {
+        force401OnDownloadOnce = false;
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { code: "UNAUTHENTICATED", message: "expired before dl", request_id: "r_dl" } }));
+        return;
+      }
+      if (return202Once) {
+        return202Once = false;
+        res.writeHead(202, { "Content-Type": "application/json", "Retry-After": "1" });
+        res.end(JSON.stringify({ error: { code: "RENDERING", message: "retry later", request_id: "r_202" } }));
+        return;
+      }
+      res.writeHead(200, {
+        "Content-Type": "text/markdown; charset=utf-8",
+        "Content-Disposition": "attachment; filename*=UTF-8''%E8%B0%83%E7%A0%94%E6%8A%A5%E5%91%8A.md",
+        "X-Content-SHA256": "b".repeat(64),
+      });
+      res.end("# 调研结论\n支持自动内联。");
+      return;
+    }
+
+    if (req.method === "GET" && url === "/v0/documents/doc_big/downloads") {
+      res.writeHead(200, { "Content-Type": "text/plain", "Content-Length": "2048" });
+      res.end("A".repeat(2048));
+      return;
+    }
+
+    if (req.method === "GET" && url === "/v0/document-versions/ver_1/content") {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("immutable version body");
+      return;
+    }
+
     res.writeHead(404);
     res.end();
   });
@@ -213,6 +279,37 @@ test("LingerClient login, 0600 cache, /v0/me 401 recovery, concurrent 401 safety
     tamperIdentity = true;
     const client4 = new LingerClient(config, store);
     await assert.rejects(() => client4.verifyLocalIdentity(), /proof mismatch/);
+
+    // Verify new document metadata & download endpoints with 401 recovery, 202 retry, and maxBytes protection.
+    tamperIdentity = false;
+    return429OnRooms = false;
+    const docCfg = parseConfig({
+      LINGER_URL: baseUrl,
+      LINGER_EMAIL: "user@example.com",
+      LINGER_PASSWORD: "secret",
+      LINGER_SESSION_FILE: sessionFile,
+    });
+    assert.equal(docCfg.defaultWaitSeconds, 60);
+    assert.equal(docCfg.autoInlineDocuments, true);
+    assert.equal(docCfg.inlineDocumentMaxChars, 32_768);
+    assert.equal(docCfg.documentMaxDownloadBytes, 10_485_760);
+
+    const docClient = new LingerClient(docCfg, store);
+    const meta = await docClient.getDocument("doc_1");
+    assert.equal(meta.title, "调研报告");
+    const dl = await docClient.downloadLatestDocument("doc_1");
+    assert.equal(dl.filename, "调研报告.md");
+    assert.equal(dl.media_type, "text/markdown");
+    assert.equal(dl.sha256, "b".repeat(64));
+    assert.equal(dl.bytes.toString("utf8"), "# 调研结论\n支持自动内联。");
+
+    const verDl = await docClient.downloadDocumentVersion("ver_1");
+    assert.equal(verDl.bytes.toString("utf8"), "immutable version body");
+
+    await assert.rejects(
+      () => docClient.downloadLatestDocument("doc_big", 512),
+      (err: unknown) => err instanceof LingerApiError && err.code === "DOCUMENT_TOO_LARGE"
+    );
   } finally {
     server.close();
     await rm(dir, { recursive: true, force: true });
