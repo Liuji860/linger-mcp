@@ -1,4 +1,4 @@
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ApprovalMode, LingerMcpConfig, RoomMode } from "./types.js";
 
@@ -172,6 +172,11 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): LingerMcpConf
 
   const sessionFile =
     env.LINGER_SESSION_FILE?.trim() || join(homedir(), ".config", "linger-mcp", "session.json");
+  const downloadDir =
+    env.LINGER_DOWNLOAD_DIR?.trim() || join(tmpdir(), "linger-mcp-downloads");
+  if (sessionFile.includes("\0") || downloadDir.includes("\0")) {
+    throw new Error("File paths in config must not contain NUL bytes");
+  }
 
   return {
     baseUrl,
@@ -192,8 +197,24 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): LingerMcpConf
       allowHumanConfirmedRelay: parseBool(env.LINGER_ALLOW_HUMAN_CONFIRMED_RELAY, approvalMode === "relay"),
     },
     pollIntervalMs: parseIntInRange(env.LINGER_POLL_INTERVAL_MS, 1500, 100, 30_000, "LINGER_POLL_INTERVAL_MS"),
-    defaultWaitSeconds: parseIntInRange(env.LINGER_DEFAULT_WAIT_SECONDS, 25, 0, 300, "LINGER_DEFAULT_WAIT_SECONDS"),
+    defaultWaitSeconds: parseIntInRange(env.LINGER_DEFAULT_WAIT_SECONDS, 60, 0, 300, "LINGER_DEFAULT_WAIT_SECONDS"),
     maxConcurrency: parseIntInRange(env.LINGER_MAX_CONCURRENCY, 2, 1, 10, "LINGER_MAX_CONCURRENCY"),
     requestTimeoutMs: parseIntInRange(env.LINGER_REQUEST_TIMEOUT_MS, 30_000, 1000, 120_000, "LINGER_REQUEST_TIMEOUT_MS"),
+    autoInlineDocuments: parseBool(env.LINGER_AUTO_INLINE_DOCUMENTS, true),
+    inlineDocumentMaxChars: parseIntInRange(
+      env.LINGER_INLINE_DOCUMENT_MAX_CHARS,
+      32_768,
+      1024,
+      200_000,
+      "LINGER_INLINE_DOCUMENT_MAX_CHARS"
+    ),
+    documentMaxDownloadBytes: parseIntInRange(
+      env.LINGER_DOC_MAX_BYTES,
+      10_485_760,
+      65_536,
+      52_428_800,
+      "LINGER_DOC_MAX_BYTES"
+    ),
+    downloadDir,
   };
 }
