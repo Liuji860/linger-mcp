@@ -1020,12 +1020,19 @@ test("Stdio MCP Server E2E flows with opu tiered approval policy", async () => {
     assert.equal(initialDone.status, "completed");
     assert.match(initialDone.reply_text as string, /先启动后台任务/);
 
-    const followupDone = parseToolJson(
-      (await client.callTool({
+      // While wait_for_followup is polling, a concurrent ask_agent on the same agent/room is rejected cleanly.
+      const followupPromise = client.callTool({
         name: "linger_get_reply",
         arguments: { job_id: initialDone.job_id, wait_seconds: 5, wait_for_followup: true },
-      })) as never
-    );
+      });
+      const concurrentDuringFollowup = (await client.callTool({
+        name: "linger_ask_agent",
+        arguments: { agent: "opu", prompt: "SCENARIO_MULTI_MSG", wait_seconds: 1 },
+      })) as { isError?: boolean; content: Array<{ text?: string }> };
+      assert.equal(concurrentDuringFollowup.isError, true);
+      assert.match(concurrentDuringFollowup.content[0]?.text ?? "", /already has an active job/);
+
+      const followupDone = parseToolJson((await followupPromise) as never);
     assert.equal(followupDone.status, "completed");
     assert.match(followupDone.reply_text as string, /后台任务完成/);
     const followupDocs = followupDone.documents as Array<Record<string, unknown>>;

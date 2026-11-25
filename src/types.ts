@@ -166,8 +166,20 @@ export interface DocumentMetadata {
   updated_at: string;
 }
 
-export interface DocumentDownloadResult {
+export interface DocumentVersionMetadata {
+  id: string;
+  document_id: string;
+  version_number: number;
   filename: string;
+  representation_format: string;
+  media_type: string;
+  size_bytes: number;
+  sha256: string;
+  created_at: string;
+}
+
+export interface DocumentDownloadResult {
+  filename?: string;
   media_type: string;
   sha256?: string;
   size_bytes: number;
@@ -183,6 +195,14 @@ export interface ReplyDocumentRef {
   filename?: string;
   media_type?: string;
   size_bytes?: number;
+  unavailable?: boolean;
+}
+
+export interface CachedDocumentEntry {
+  summary: ReplyDocumentSummary;
+  updatedAt?: string;
+  maxChars: number;
+  immutable: boolean;
 }
 
 export interface ReplyDocumentSummary {
@@ -499,7 +519,8 @@ export interface JobRecord {
   replyMessageIds: Set<string>;
   cardsByMessageId: Map<string, DecisionRequestedMessageCard>;
   processedCardVersions: Map<string, string>;
-  hydratedDocuments?: Map<string, ReplyDocumentSummary>;
+  hydratedDocuments?: Map<string, CachedDocumentEntry>;
+  followupWaiting?: boolean;
   autoApprovals: AutoApprovalAuditEntry[];
   createdAt: string;
   updatedAt: string;

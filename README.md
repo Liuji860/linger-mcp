@@ -91,7 +91,7 @@
     </td>
     <td align="center" width="33%">
       <a href="./docs/posters/06-quickstart.png"><img src="./docs/posters/06-quickstart.png" width="280" alt="06 3 步快速接入" /></a><br />
-      <sub><b>06 快速上手</b> · 3 步接入 + 7 工具</sub>
+      <sub><b>06 快速上手</b> · 3 步接入 + 8 工具</sub>
     </td>
   </tr>
 </table>
@@ -128,7 +128,7 @@ sequenceDiagram
   A->>T: agent_run.status_changed (completed / aborted)
   opt 回复包含 Linger 文档卡片或附件
     M->>T: GET /v0/documents/{id} & /downloads
-    T-->>M: 导出 Markdown/文本正文 (<=32KB 自动内联)
+    T-->>M: 导出 Markdown/文本正文 (<=32K 字符自动内联)
   end
   M-->>C: 合并回复文本、内联文档正文与自动审批审计记录
 ```

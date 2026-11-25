@@ -7,17 +7,20 @@ import type { LingerClient } from "../src/client.js";
 import { LingerApiError } from "../src/client.js";
 import { parseConfig } from "../src/config.js";
 import {
+  extractBoundedMessageHtmlFragments,
   extractMessageDocumentRefs,
   extractMessageHtmlFragments,
   hydrateReplyDocuments,
   isTextLikeDocument,
+  mergeDocumentRefs,
   readDocument,
   sanitizeDownloadFilename,
   saveDownloadedFile,
   sliceUtf16Safe,
   validateDocumentId,
+  validateEntityId,
 } from "../src/documents.js";
-import type { DocumentMetadata, Message, ReplyDocumentSummary } from "../src/types.js";
+import type { CachedDocumentEntry, DocumentMetadata, Message } from "../src/types.js";
 
 function makeMessage(partial: Partial<Message>): Message {
   return {
@@ -115,21 +118,31 @@ test("sliceUtf16Safe paginates without splitting UTF-16 surrogate pairs", () => 
 test("isTextLikeDocument separates UTF-8 text from NUL/binary payloads", () => {
   assert.equal(isTextLikeDocument({ mediaType: "text/markdown; charset=utf-8", bytes: Buffer.from("# Title\nBody") }), true);
   assert.equal(isTextLikeDocument({ mediaType: "application/json", bytes: Buffer.from('{"ok":true}') }), true);
-  assert.equal(isTextLikeDocument({ representationFormat: "markdown", bytes: Buffer.from("中文正文") }), true);
+  assert.equal(isTextLikeDocument({ representationFormat: "markdown", filename: "notes.bin", bytes: Buffer.from("中文正文") }), true);
   assert.equal(isTextLikeDocument({ mediaType: "text/plain", bytes: Buffer.from([0x41, 0x00, 0x42]) }), false);
   assert.equal(isTextLikeDocument({ mediaType: "application/pdf", filename: "report.pdf", bytes: Buffer.from("%PDF-1.7") }), false);
   assert.equal(isTextLikeDocument({ mediaType: "application/octet-stream", filename: "notes.txt", bytes: Buffer.from([0xff, 0xfe]) }), false);
+
+  // Multi-byte UTF-8 character straddling the 8192-byte sample cut (3-byte CJK starting at 8190).
+  const multiBytePrefix = Buffer.alloc(8190, 0x41);
+  const cjkChar = Buffer.from("中", "utf8"); // 3 bytes: bytes 8190, 8191, 8192
+  const straddlingPayload = Buffer.concat([multiBytePrefix, cjkChar, Buffer.from("trailing")]);
+  assert.equal(isTextLikeDocument({ mediaType: "application/octet-stream", filename: "straddle.md", bytes: straddlingPayload }), true);
 });
 
 test("sanitizeDownloadFilename and saveDownloadedFile enforce traversal safety and 0700/0600 modes", async () => {
   assert.equal(validateDocumentId("document_123-abc"), "document_123-abc");
+  assert.throws(() => validateEntityId(".", "document_id"), /Invalid document_id/);
+  assert.throws(() => validateEntityId("..", "document_version_id"), /Invalid document_version_id/);
   assert.throws(() => validateDocumentId("../etc/passwd"), /Invalid document_id/);
   assert.throws(() => validateDocumentId("doc/1"), /Invalid document_id/);
+  assert.throws(() => validateDocumentId("doc%2f1"), /Invalid document_id/);
 
-  const sanitized = sanitizeDownloadFilename("../../weird:name?.md\x00", "doc_1/2");
+  const sanitized = sanitizeDownloadFilename("../../weird:name?.md\x00\u202e", "doc_1/2");
   assert.equal(sanitized.startsWith("doc_1_2-"), true);
   assert.equal(sanitized.includes(".."), false);
   assert.equal(sanitized.includes("/"), false);
+  assert.equal(sanitized.includes("\u202e"), false);
   assert.equal(sanitized.endsWith(".md"), true);
 
   const root = await mkdtemp(join(tmpdir(), "linger-doc-save-"));
@@ -152,6 +165,7 @@ test("sanitizeDownloadFilename and saveDownloadedFile enforce traversal safety a
     await mkdir(realTarget);
     await symlink(realTarget, linkDir);
     await assert.rejects(() => saveDownloadedFile(linkDir, "doc_abc", "test.txt", Buffer.from("x")), /not a real directory/);
+    await assert.rejects(() => saveDownloadedFile(`${linkDir}/`, "doc_abc", "test.txt", Buffer.from("x")), /not a real directory/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -207,16 +221,62 @@ test("readDocument and hydrateReplyDocuments handle pagination, caching, budget 
         if (id === "doc_flaky") {
           return makeDocMeta({ id: "doc_flaky", title: "Recovered Doc" });
         }
+        if (id === "doc_wiki") {
+          return makeDocMeta({
+            id: "doc_wiki",
+            title: "Wiki Page",
+            current_version: { id: "ver_wiki_1", version_number: 1, sha256: "d".repeat(64) },
+            capabilities: {
+              read: true,
+              write: false,
+              manage: false,
+              delete: false,
+              duplicate: false,
+              export: false,
+              comment: false,
+              use_as_context: true,
+            },
+          });
+        }
         const entry = docs.get(id);
         if (!entry) {
           throw new LingerApiError(404, "NOT_FOUND", "missing");
         }
         return entry.meta;
       },
+      async getDocumentVersion(verId: string) {
+        if (verId === "ver_other_doc") {
+          return {
+            id: "ver_other_doc",
+            document_id: "doc_unrelated",
+            version_number: 1,
+            filename: "other.txt",
+            representation_format: "plain_text",
+            media_type: "text/plain",
+            size_bytes: 5,
+            sha256: "e".repeat(64),
+            created_at: new Date().toISOString(),
+          };
+        }
+        return {
+          id: verId,
+          document_id: "doc_wiki",
+          version_number: 1,
+          filename: "wiki.md",
+          representation_format: "markdown",
+          media_type: "text/markdown",
+          size_bytes: 12,
+          sha256: "d".repeat(64),
+          created_at: new Date().toISOString(),
+        };
+      },
       async downloadLatestDocument(id: string) {
         if (id === "doc_small") smallFetchCount++;
         if (id === "doc_flaky") {
           return { filename: "flaky.md", media_type: "text/markdown", size_bytes: 9, bytes: Buffer.from("recovered") };
+        }
+        if (id === "doc_wiki") {
+          throw new Error("Should not hit /downloads when capabilities.export=false");
         }
         const entry = docs.get(id)!;
         return {
@@ -226,12 +286,20 @@ test("readDocument and hydrateReplyDocuments handle pagination, caching, budget 
           bytes: entry.bytes,
         };
       },
-      async downloadDocumentVersion() {
-        throw new Error("not used");
+      async downloadDocumentVersion(verId: string) {
+        if (verId === "ver_wiki_1") {
+          return {
+            filename: "wiki.md",
+            media_type: "text/markdown",
+            size_bytes: 14,
+            bytes: Buffer.from("# Wiki Content"),
+          };
+        }
+        throw new Error(`unexpected version ${verId}`);
       },
     } as unknown as LingerClient;
 
-    const cache = new Map<string, ReplyDocumentSummary>();
+    const cache = new Map<string, CachedDocumentEntry>();
     const refs = [
       { document_id: "doc_small", title: "Small Doc", source_type: "document" as const, presentation: "card" as const },
       { document_id: "doc_large", title: "Large Doc", source_type: "document" as const },
@@ -248,11 +316,42 @@ test("readDocument and hydrateReplyDocuments handle pagination, caching, budget 
     assert.equal(first[2]?.status, "binary");
     assert.equal(first[3]?.status, "error");
 
-    // Second pass reuses cache for doc_small (fetch count stays 1) and retries doc_flaky.
+    // Second pass reuses cache for unchanged doc_small (downloadLatestDocument count stays 1) and retries doc_flaky.
     const second = await hydrateReplyDocuments(mockClient, config, refs, cache);
     assert.equal(smallFetchCount, 1);
     assert.equal(second[3]?.status, "inlined");
     assert.equal(second[3]?.content, "recovered");
+
+    // Updated live native Document invalidates cache and re-fetches updated body.
+    const smallEntry = docs.get("doc_small")!;
+    smallEntry.meta = { ...smallEntry.meta, updated_at: new Date(Date.now() + 5000).toISOString() };
+    smallEntry.bytes = Buffer.from("# Heading\nUpdated findings.");
+    const third = await hydrateReplyDocuments(mockClient, config, [refs[0]!], cache);
+    assert.equal(smallFetchCount, 2);
+    assert.equal(third[0]?.content, "# Heading\nUpdated findings.");
+
+    // wiki_page with capabilities.export=false falls back to current_version download cleanly.
+    const wikiDoc = await readDocument(mockClient, config, { documentId: "doc_wiki" });
+    assert.equal(wikiDoc.content, "# Wiki Content");
+
+    // Cross-document version spoofing is rejected.
+    await assert.rejects(
+      () => readDocument(mockClient, config, { documentId: "doc_wiki", documentVersionId: "ver_other_doc" }),
+      /does not belong to Document/
+    );
+
+    // Distinct versions of the same document_id are preserved when merging refs, and html fragments share snapshot budget.
+    const mergedMultiVer = mergeDocumentRefs([
+      { document_id: "doc_x", document_version_id: "ver_1", title: "v1", source_type: "file" },
+      { document_id: "doc_x", document_version_id: "ver_2", title: "v2", source_type: "file" },
+    ]);
+    assert.equal(mergedMultiVer.length, 2);
+
+    const boundedFrags = extractBoundedMessageHtmlFragments(
+      [makeMessage({ segments: [{ type: "html_fragment", content: "c1", html: "<div>" + "a".repeat(20) + "</div>" }] })],
+      10
+    );
+    assert.equal(boundedFrags.get("msg_1")?.[0]?.truncated, true);
 
     // Paginate doc_large and save binary doc_bin.
     const page2 = await readDocument(mockClient, config, { documentId: "doc_large", offset: 1024, maxChars: 1024 });
