@@ -3,6 +3,8 @@ import { SessionStore, readMacOsKeychainPassword } from "./session-store.js";
 import type {
   CurrentIdentity,
   DecisionRequest,
+  DocumentDownloadResult,
+  DocumentMetadata,
   LingerMcpConfig,
   Message,
   MessagePage,
@@ -23,6 +25,100 @@ import type {
 const IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
 const LOCAL_IDENTITY_PROOF_RE = /^[A-Za-z0-9_-]{43}$/;
 const MAX_MESSAGE_RUNES = 50_000;
+const MAX_202_RETRIES = 3;
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseContentDispositionFilename(header: string | null): string | undefined {
+  if (!header) {
+    return undefined;
+  }
+  const starMatch = /filename\*\s*=\s*(?:UTF-8|utf-8)''([^;\r\n]+)/i.exec(header);
+  if (starMatch?.[1]) {
+    try {
+      const decoded = decodeURIComponent(starMatch[1].trim().replace(/^"|"$/g, ""));
+      if (decoded) {
+        return decoded;
+      }
+    } catch {
+      // Fall through to plain filename parameter.
+    }
+  }
+  const quotedMatch = /filename\s*=\s*"([^"\r\n]+)"/i.exec(header);
+  if (quotedMatch?.[1]?.trim()) {
+    return quotedMatch[1].trim();
+  }
+  const bareMatch = /filename\s*=\s*([^;\s\r\n]+)/i.exec(header);
+  if (bareMatch?.[1]?.trim()) {
+    return bareMatch[1].trim();
+  }
+  return undefined;
+}
+
+function normalizeMediaType(header: string | null): string {
+  const base = (header ?? "application/octet-stream").split(";")[0]?.trim().toLowerCase();
+  return base || "application/octet-stream";
+}
+
+function parseSha256Header(headers: Headers): string | undefined {
+  const direct = headers.get("x-content-sha256")?.trim().toLowerCase();
+  if (direct && /^[a-f0-9]{64}$/.test(direct)) {
+    return direct;
+  }
+  const etag = headers.get("etag")?.trim().replace(/^W\//i, "").replace(/^"|"$/g, "").toLowerCase();
+  if (etag && /^[a-f0-9]{64}$/.test(etag)) {
+    return etag;
+  }
+  return undefined;
+}
+
+async function readBoundedResponseBody(response: Response, maxBytes: number): Promise<Buffer> {
+  const contentLenRaw = response.headers.get("content-length");
+  if (contentLenRaw) {
+    const declared = Number.parseInt(contentLenRaw, 10);
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new LingerApiError(
+        413,
+        "DOCUMENT_TOO_LARGE",
+        `Document size (${declared} bytes) exceeds limit (${maxBytes} bytes)`
+      );
+    }
+  }
+  if (!response.body) {
+    return Buffer.alloc(0);
+  }
+
+  const chunks: Buffer[] = [];
+  let total = 0;
+  const reader = response.body.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (!value || value.byteLength === 0) {
+        continue;
+      }
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new LingerApiError(
+          413,
+          "DOCUMENT_TOO_LARGE",
+          `Downloaded document exceeds limit (${maxBytes} bytes)`
+        );
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks, total);
+}
 
 export class LingerApiError extends Error {
   constructor(
@@ -279,7 +375,7 @@ export class LingerClient {
   private async fetchWithAuth<T>(
     method: string,
     path: string,
-    options?: { body?: unknown; headers?: Record<string, string>; rawBinary?: boolean },
+    options?: { body?: unknown; headers?: Record<string, string> },
     retriedAfter401: boolean = false
   ): Promise<T> {
     await this.ensureSession();
@@ -302,6 +398,7 @@ export class LingerClient {
     });
 
     if (response.status === 401 && !retriedAfter401) {
+      await response.body?.cancel().catch(() => undefined);
       await this.refreshSessionAfter401(usedCookie);
       return this.fetchWithAuth<T>(method, path, options, true);
     }
@@ -314,15 +411,51 @@ export class LingerClient {
       return undefined as T;
     }
 
-    if (options?.rawBinary) {
-      const buffer = Buffer.from(await response.arrayBuffer());
-      return {
-        mimeType: response.headers.get("content-type") ?? "application/octet-stream",
-        base64: buffer.toString("base64"),
-      } as T;
+    return (await response.json()) as T;
+  }
+
+  private async fetchBinaryWithAuth(
+    path: string,
+    options: { maxBytes: number; retryOn202?: boolean },
+    retriedAfter401: boolean = false,
+    attempt202: number = 0
+  ): Promise<DocumentDownloadResult> {
+    await this.ensureSession();
+    const usedCookie = this.cookie;
+
+    const response = await this.rawFetch(path, {
+      method: "GET",
+      headers: { Cookie: usedCookie as string },
+    });
+
+    if (response.status === 401 && !retriedAfter401) {
+      await response.body?.cancel().catch(() => undefined);
+      await this.refreshSessionAfter401(usedCookie);
+      return this.fetchBinaryWithAuth(path, options, true, attempt202);
     }
 
-    return (await response.json()) as T;
+    if (response.status === 202 && options.retryOn202 && attempt202 < MAX_202_RETRIES) {
+      const retryRaw = response.headers.get("retry-after");
+      const retrySec = retryRaw ? Number.parseInt(retryRaw, 10) : 1;
+      await response.body?.cancel().catch(() => undefined);
+      const waitMs = Math.max(1000, Math.min(3000, Number.isFinite(retrySec) ? retrySec * 1000 : 1000));
+      await sleepMs(waitMs);
+      return this.fetchBinaryWithAuth(path, options, retriedAfter401, attempt202 + 1);
+    }
+
+    if (response.status === 202 || !response.ok) {
+      throw await this.buildApiError(response);
+    }
+
+    const bytes = await readBoundedResponseBody(response, options.maxBytes);
+    const filename = parseContentDispositionFilename(response.headers.get("content-disposition")) ?? "document";
+    return {
+      filename,
+      media_type: normalizeMediaType(response.headers.get("content-type")),
+      sha256: parseSha256Header(response.headers),
+      size_bytes: bytes.length,
+      bytes,
+    };
   }
 
   private async requireTenantId(): Promise<string> {
@@ -537,10 +670,37 @@ export class LingerClient {
   }
 
   async getDecisionScreenshot(decisionId: string): Promise<{ mimeType: string; base64: string }> {
-    return this.fetchWithAuth<{ mimeType: string; base64: string }>(
-      "GET",
+    const result = await this.fetchBinaryWithAuth(
       `/v0/decisions/${encodeURIComponent(decisionId)}/screenshot`,
-      { rawBinary: true }
+      { maxBytes: this.config.documentMaxDownloadBytes, retryOn202: false }
     );
+    return {
+      mimeType: result.media_type,
+      base64: result.bytes.toString("base64"),
+    };
+  }
+
+  async getDocument(documentId: string): Promise<DocumentMetadata> {
+    return this.fetchWithAuth<DocumentMetadata>("GET", `/v0/documents/${encodeURIComponent(documentId)}`);
+  }
+
+  async downloadLatestDocument(
+    documentId: string,
+    maxBytes: number = this.config.documentMaxDownloadBytes
+  ): Promise<DocumentDownloadResult> {
+    return this.fetchBinaryWithAuth(`/v0/documents/${encodeURIComponent(documentId)}/downloads`, {
+      maxBytes,
+      retryOn202: true,
+    });
+  }
+
+  async downloadDocumentVersion(
+    documentVersionId: string,
+    maxBytes: number = this.config.documentMaxDownloadBytes
+  ): Promise<DocumentDownloadResult> {
+    return this.fetchBinaryWithAuth(`/v0/document-versions/${encodeURIComponent(documentVersionId)}/content`, {
+      maxBytes,
+      retryOn202: false,
+    });
   }
 }

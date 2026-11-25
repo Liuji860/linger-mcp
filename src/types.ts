@@ -120,7 +120,96 @@ export type MessageSegment =
   | { type: "reference"; content: string; target: string; target_type: "user" | "agent" }
   | { type: "document"; content: string; document_id: string; presentation?: "inline" | "card" | "canvas" }
   | { type: "file"; content: string; document_id: string; document_version_id: string; filename?: string; media_type?: string }
+  | { type: "html_fragment"; content: string; html: string }
+  | {
+      type: "artifact_tree";
+      content: string;
+      publication_group_id: string;
+      root_path: string;
+      file_count: number;
+      directory_count: number;
+      total_bytes: number;
+      entry_document_id?: string;
+      entry_document_version_id?: string;
+    }
   | { type: string; content: string; [key: string]: unknown };
+
+export interface DocumentCapabilities {
+  read: boolean;
+  write: boolean;
+  manage: boolean;
+  delete: boolean;
+  duplicate: boolean;
+  export: boolean;
+  comment: boolean;
+  use_as_context: boolean;
+}
+
+export interface DocumentVersionRef {
+  id: string;
+  version_number: number;
+  sha256: string;
+}
+
+export interface DocumentMetadata {
+  id: string;
+  tenant_id: string;
+  title: string;
+  format: string;
+  representation_format: string;
+  status: "active" | "trashed";
+  current_version: DocumentVersionRef | null;
+  draft_capability: "none" | "read" | "write";
+  can_edit_native_content: boolean;
+  capabilities: DocumentCapabilities;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DocumentDownloadResult {
+  filename: string;
+  media_type: string;
+  sha256?: string;
+  size_bytes: number;
+  bytes: Buffer;
+}
+
+export interface ReplyDocumentRef {
+  document_id: string;
+  document_version_id?: string;
+  title: string;
+  source_type: "document" | "file" | "attachment" | "artifact_tree";
+  presentation?: "inline" | "card" | "canvas";
+  filename?: string;
+  media_type?: string;
+  size_bytes?: number;
+}
+
+export interface ReplyDocumentSummary {
+  document_id: string;
+  document_version_id?: string;
+  title: string;
+  source_type: ReplyDocumentRef["source_type"];
+  presentation?: "inline" | "card" | "canvas";
+  status: "inlined" | "truncated" | "binary" | "skipped" | "error";
+  format?: string;
+  representation_format?: string;
+  filename?: string;
+  media_type?: string;
+  size_bytes?: number;
+  total_chars?: number;
+  returned_chars?: number;
+  content?: string;
+  has_more?: boolean;
+  next_offset?: number;
+  error?: string;
+}
+
+export interface ReplyHtmlFragment {
+  title: string;
+  html: string;
+  truncated: boolean;
+}
 
 export interface MessageAttachment {
   id: string;
@@ -348,6 +437,10 @@ export interface LingerMcpConfig {
   defaultWaitSeconds: number;
   maxConcurrency: number;
   requestTimeoutMs: number;
+  autoInlineDocuments: boolean;
+  inlineDocumentMaxChars: number;
+  documentMaxDownloadBytes: number;
+  downloadDir: string;
 }
 
 export type ApprovalTier = "auto" | "codex" | "human";
@@ -406,6 +499,7 @@ export interface JobRecord {
   replyMessageIds: Set<string>;
   cardsByMessageId: Map<string, DecisionRequestedMessageCard>;
   processedCardVersions: Map<string, string>;
+  hydratedDocuments?: Map<string, ReplyDocumentSummary>;
   autoApprovals: AutoApprovalAuditEntry[];
   createdAt: string;
   updatedAt: string;
