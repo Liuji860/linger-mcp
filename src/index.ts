@@ -16,7 +16,12 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
+  let shuttingDown = false;
   const shutdown = async () => {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
     await server.close().catch(() => undefined);
     process.exit(0);
   };

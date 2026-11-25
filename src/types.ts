@@ -282,6 +282,13 @@ export interface RoomRunStatusList {
   items: RoomRunStatus[];
 }
 
+export interface RoomRunCancelResult {
+  run_id: string;
+  status: string;
+  agent_actor_id?: string;
+  message_ids?: string[];
+}
+
 export type RoomEventPayload =
   | { kind: "message.created"; message: Message }
   | { kind: "card.changed"; message_id: string; version: number }
@@ -305,13 +312,12 @@ export interface RoomEventPage {
   has_more: boolean;
 }
 
-export type DecisionAnswerAction = "approve" | "deny" | "submit" | "connected" | "skipped" | "done";
+export type DecisionAnswerAction = "approve" | "deny" | "submit";
 
 export interface DecisionRequest {
   expected_version: number;
   decision: DecisionAnswerAction;
   comment?: string;
-  connection_id?: string;
   answers?: Record<string, string | string[]>;
 }
 
@@ -334,6 +340,7 @@ export interface LingerMcpConfig {
   keychainService?: string;
   sessionFile: string;
   localIdentityKey?: string;
+  localIdentityOrigin?: string;
   roomMode: RoomMode;
   bridgeRoomName: string;
   approvalPolicy: ApprovalPolicyConfig;
@@ -388,6 +395,7 @@ export interface JobRecord {
   agentName: string;
   prompt: string;
   triggerMessageId: string;
+  seenTrigger: boolean;
   cursorSeq: number;
   runId?: string;
   runStatus?: RoomRunState;
