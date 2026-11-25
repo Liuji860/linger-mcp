@@ -29,7 +29,7 @@ sequenceDiagram
       M-->>C: 返回 require_human (仅人在 Linger/OS 处理)
     end
   end
-  A->>T: agent_run.status_changed (completed / replied=true)
+  A->>T: agent_run.status_changed (completed / aborted)
   M-->>C: 合并回复文本、附件与自动审批审计记录
 ```
 
@@ -37,7 +37,7 @@ sequenceDiagram
 
 | 分级 | 涵盖卡片类型 | 默认行为 | 说明 |
 | --- | --- | --- | --- |
-| **自动放行 (`auto`)** | `runtime_permission` (`code`) | 满足白名单且无高危语法时自动 `approve` | 拒绝 `; && \|\| \| \` $( > <`、补丁/脚本及高危命令；记录审计日志 |
+| **自动放行 (`auto`)** | `runtime_permission` (`code`) | 满足白名单且无高危语法/参数时自动 `approve` | 拒绝 `; && \|\| \| \` $( > < ( )`、补丁/脚本、敏感路径及危险参数；记录审计日志 |
 | **Codex 审阅 (`codex`)** | 非白名单 `runtime_permission` (`code` / `gui`)、`question` | 返回 `pending_approval`，由 Codex 调用 `linger_decide_card` 批复或答复 | `approve` 不允许附带 `comment`；`question` 用 `submit` 传 `answers` |
 | **强制留给人 (`human`)** | `connector_write`、`agent_change`、`room_creation`、`connection_auth`、`provider_key`、`browser_connection`、`computer_permission`、`search_key`、`profile_setup_*` | 返回 `require_human`，禁止自动审批 | 后几类系统/OAuth 卡服务端仅允许在 Linger/OS 完成，接口仅支持 `deny` |
 
@@ -45,10 +45,10 @@ sequenceDiagram
 
 ## 快速接入 Codex
 
-1. 构建项目：
+1. 构建项目（使用锁定的依赖版本）：
 
 ```bash
-npm install
+npm ci
 npm run build
 ```
 
@@ -87,14 +87,16 @@ LINGER_APPROVAL_MODE = "tiered"
 
 ## 环境变量说明
 
-- `LINGER_URL`（必填）：Linger TeamHub 服务地址
+- `LINGER_URL`（必填）：Linger TeamHub 服务地址（非回环地址必须使用 `https://`，除非显式设置 `LINGER_ALLOW_INSECURE_HTTP=true`）
 - `LINGER_EMAIL` / `LINGER_PASSWORD` / `LINGER_KEYCHAIN_SERVICE`：账号与密码（优先用钥匙串）
-- `LINGER_LOCAL_IDENTITY_KEY`（可选）：本地安装时校验 `POST /v0/local/identity` 的 32 字节 Base64 密钥
+- `LINGER_LOCAL_IDENTITY_KEY` / `LINGER_LOCAL_IDENTITY_ORIGIN`（可选）：本地安装时校验 `POST /v0/local/identity` 的 32 字节 Base64 密钥与 Web Origin
 - `LINGER_ROOM_MODE`：`bridge`（默认，使用独立 `Codex Bridge` 群聊）或 `direct`（1v1 单聊）
 - `LINGER_APPROVAL_MODE`：`tiered`（默认）| `relay` | `manual`
 - `LINGER_APPROVAL_ALLOW_TOOLS`：逗号分隔允许自动放行的只读工具名
 - `LINGER_APPROVAL_ALLOW_CMD_PREFIXES`：逗号分隔允许自动放行的命令前缀
-- `LINGER_APPROVAL_DENY_PATTERNS`：额外禁止自动放行的正则（逗号分隔或 JSON 数组）
+- `LINGER_APPROVAL_DENY_PATTERNS`：额外禁止自动放行的正则（推荐 JSON 数组格式，如 `["pattern1","pattern2"]`）
+- `LINGER_ALLOW_GUI_APPROVAL`：是否允许白名单内的 GUI 操作自动审批（默认 `false`）
+- `LINGER_ALLOW_HUMAN_CONFIRMED_RELAY`：是否允许在带 `human_confirmed=true` 时经由 MCP 转发高风险卡（`relay` 模式默认 `true`，`tiered` 模式默认 `false`）
 - `LINGER_MAX_CONCURRENCY`：并发任务上限（默认 `2`，防止本地模型抢占）
 
 ## 测试

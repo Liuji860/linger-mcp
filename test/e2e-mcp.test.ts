@@ -109,11 +109,14 @@ class MockTeamHubServer {
     this.emitRunStatus(roomId, runId, "active", false);
 
     if (prompt.includes("SCENARIO_MULTI_MSG")) {
+      // Simulate TeamHub setting replied=true early on an active run before final completion.
       this.appendAgentMessage(roomId, "收到，正在核查资料...");
+      this.emitRunStatus(roomId, runId, "active", true);
       setTimeout(() => {
+        this.emitRunStatus(roomId, runId, "active", false);
         this.appendAgentMessage(roomId, "核查完成，最终结论：可以上线。");
         this.emitRunStatus(roomId, runId, "completed", true);
-      }, 120);
+      }, 150);
       return;
     }
 
@@ -488,10 +491,23 @@ class MockTeamHubServer {
 
     const cancelMatch = /^\/v0\/rooms\/([^/]+)\/runs\/([^/]+)\/cancel$/.exec(path);
     if (cancelMatch && req.method === "POST") {
+      // Strictly enforce OpenAPI RoomRunCancelRequest: required request_id, additionalProperties: false.
+      const body = JSON.parse(rawBody) as Record<string, unknown>;
+      const keys = Object.keys(body);
+      if (
+        keys.length !== 1 ||
+        keys[0] !== "request_id" ||
+        typeof body.request_id !== "string" ||
+        !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(body.request_id)
+      ) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { code: "INVALID_REQUEST", message: "invalid RoomRunCancelRequest", request_id: "r" } }));
+        return;
+      }
       const runId = decodeURIComponent(cancelMatch[2] as string);
       this.canceledRuns.push(runId);
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ run_id: runId, cancel_requested: true }));
+      res.end(JSON.stringify({ run_id: runId, status: "active", agent_actor_id: "agent_opu", message_ids: [] }));
       return;
     }
 
@@ -539,7 +555,7 @@ test("Stdio MCP Server E2E flows with opu tiered approval policy", async () => {
     assert.equal(agents.length, 1);
     assert.equal(agents[0]?.display_name, "opu");
 
-    // 2. Multi-message response waits for completed status
+    // 2. Multi-message response ignores early active replied=true flip and waits for completed status
     const multi = parseToolJson(
       (await client.callTool({
         name: "linger_ask_agent",
@@ -550,7 +566,7 @@ test("Stdio MCP Server E2E flows with opu tiered approval policy", async () => {
     assert.match(multi.reply_text as string, /正在核查资料/);
     assert.match(multi.reply_text as string, /可以上线/);
 
-    // 3. Long-running async job returns running job_id, then linger_get_reply completes + recovers from 401
+    // 3. Long-running async job returns running job_id, then concurrent linger_get_reply + 401 recovery completes cleanly
     mock.expireNextEventPoll = true;
     const asyncStart = parseToolJson(
       (await client.callTool({
@@ -561,14 +577,21 @@ test("Stdio MCP Server E2E flows with opu tiered approval policy", async () => {
     assert.equal(asyncStart.status, "running");
     assert.ok(typeof asyncStart.job_id === "string");
 
-    const asyncDone = parseToolJson(
-      (await client.callTool({
-        name: "linger_get_reply",
-        arguments: { job_id: asyncStart.job_id, wait_seconds: 5 },
-      })) as never
-    );
-    assert.equal(asyncDone.status, "completed");
-    assert.match(asyncDone.reply_text as string, /长耗时分析已完成/);
+    // Same-agent concurrent call in the same Bridge Room is rejected cleanly rather than cross-talking.
+    const sameAgentBlocked = (await client.callTool({
+      name: "linger_ask_agent",
+      arguments: { agent: "opu", prompt: "SCENARIO_MULTI_MSG", wait_seconds: 1 },
+    })) as { isError?: boolean; content: Array<{ text?: string }> };
+    assert.equal(sameAgentBlocked.isError, true);
+    assert.match(sameAgentBlocked.content[0]?.text ?? "", /already has an active job/);
+
+    const [asyncDoneA, asyncDoneB] = await Promise.all([
+      client.callTool({ name: "linger_get_reply", arguments: { job_id: asyncStart.job_id, wait_seconds: 5 } }),
+      client.callTool({ name: "linger_get_reply", arguments: { job_id: asyncStart.job_id, wait_seconds: 5 } }),
+    ]);
+    assert.equal(parseToolJson(asyncDoneA as never).status, "completed");
+    assert.equal(parseToolJson(asyncDoneB as never).status, "completed");
+    assert.match(parseToolJson(asyncDoneA as never).reply_text as string, /长耗时分析已完成/);
 
     // 4. Allowlisted runtime_permission(code) auto-approved with audit record
     const autoApproved = parseToolJson(
@@ -673,6 +696,15 @@ test("Stdio MCP Server E2E flows with opu tiered approval policy", async () => {
     assert.equal(blockedCompPerm.ok, false);
     assert.equal(blockedCompPerm.status, "blocked_by_policy");
 
+    const uncachedBlocked = parseToolJson(
+      (await client.callTool({
+        name: "linger_decide_card",
+        arguments: { decision_id: "dec_unknown_uncached", decision: "approve", human_confirmed: true },
+      })) as never
+    );
+    assert.equal(uncachedBlocked.ok, false);
+    assert.equal(uncachedBlocked.status, "blocked_by_policy");
+
     const staleConflict = parseToolJson(
       (await client.callTool({
         name: "linger_decide_card",
@@ -682,11 +714,11 @@ test("Stdio MCP Server E2E flows with opu tiered approval policy", async () => {
     assert.equal(staleConflict.ok, false);
     assert.equal(staleConflict.status, "conflict_or_expired");
 
-    // 8. Rooms & cancellation work cleanly
+    // 8. Cancel job (validates OpenAPI RoomRunCancelRequest) & list/read rooms
     const cancelRes = parseToolJson(
       (await client.callTool({
         name: "linger_cancel_job",
-        arguments: { job_id: highRisk.job_id, reason: "Test cancel" },
+        arguments: { job_id: highRisk.job_id },
       })) as never
     );
     assert.equal(cancelRes.canceled, true);
@@ -695,6 +727,11 @@ test("Stdio MCP Server E2E flows with opu tiered approval policy", async () => {
       (await client.callTool({ name: "linger_list_rooms", arguments: {} })) as never
     );
     assert.equal((roomsRes.rooms as Array<unknown>).length, 1);
+
+    const readRoomRes = parseToolJson(
+      (await client.callTool({ name: "linger_read_room", arguments: { room_id: highRisk.room_id, limit: 5 } })) as never
+    );
+    assert.ok(Array.isArray(readRoomRes.items));
   } finally {
     await client.close().catch(() => undefined);
     await mock.stop();

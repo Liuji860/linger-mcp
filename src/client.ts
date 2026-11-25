@@ -11,6 +11,7 @@ import type {
   RoomEventPage,
   RoomListItem,
   RoomPage,
+  RoomRunCancelResult,
   RoomRunStatusList,
   Session,
   TenantAgent,
@@ -18,6 +19,10 @@ import type {
   TenantAgentAvailabilitySnapshot,
   TenantAgentPage,
 } from "./types.js";
+
+const IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
+const LOCAL_IDENTITY_PROOF_RE = /^[A-Za-z0-9_-]{43}$/;
+const MAX_MESSAGE_RUNES = 50_000;
 
 export class LingerApiError extends Error {
   constructor(
@@ -49,7 +54,7 @@ function extractSessionCookie(headers: Headers): string | null {
         : [];
 
   for (const header of setCookies) {
-    const match = /(?:^|,\s*)(teamhub_session=[^;\s]+)/.exec(header);
+    const match = /(?:^|,\s*)(teamhub_session=[^\s;,]+)/.exec(header);
     if (match?.[1]) {
       return match[1];
     }
@@ -62,6 +67,7 @@ export class LingerClient {
   private tenantId: string | null = null;
   private humanActorId: string | null = null;
   private loginPromise: Promise<void> | null = null;
+  private localIdentityVerified = false;
 
   constructor(
     private readonly config: LingerMcpConfig,
@@ -77,11 +83,11 @@ export class LingerClient {
   }
 
   /**
-   * Verifies a local Linger installation before sending credentials when
-   * LINGER_LOCAL_IDENTITY_KEY (32-byte standard base64) is configured.
+   * Verifies a local Linger installation before sending credentials or cached cookies
+   * when LINGER_LOCAL_IDENTITY_KEY (32-byte standard base64) is configured.
    */
   async verifyLocalIdentity(): Promise<void> {
-    if (!this.config.localIdentityKey) {
+    if (!this.config.localIdentityKey || this.localIdentityVerified) {
       return;
     }
     const key = Buffer.from(this.config.localIdentityKey, "base64");
@@ -89,7 +95,7 @@ export class LingerClient {
       throw new Error("LINGER_LOCAL_IDENTITY_KEY must decode to exactly 32 bytes");
     }
     const nonce = randomBytes(32).toString("base64url");
-    const origin = new URL(this.config.baseUrl).origin;
+    const origin = this.config.localIdentityOrigin ?? new URL(this.config.baseUrl).origin;
     const expected = createHmac("sha256", key)
       .update(`linger-local-identity\n${nonce}\n${origin}`)
       .digest();
@@ -103,13 +109,14 @@ export class LingerClient {
       throw await this.buildApiError(response);
     }
     const data = (await response.json()) as { proof?: string };
-    if (!data.proof) {
-      throw new Error("Local identity verification returned empty proof");
+    if (!data.proof || !LOCAL_IDENTITY_PROOF_RE.test(data.proof)) {
+      throw new Error("Local identity verification returned invalid proof format");
     }
     const actual = Buffer.from(data.proof, "base64url");
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
       throw new Error("Local identity proof mismatch: target server is not the expected local Linger instance");
     }
+    this.localIdentityVerified = true;
   }
 
   async ensureSession(): Promise<void> {
@@ -124,35 +131,59 @@ export class LingerClient {
     await this.loginPromise;
   }
 
+  private async refreshSessionAfter401(failedCookie: string | null): Promise<void> {
+    if (this.loginPromise) {
+      await this.loginPromise;
+      return;
+    }
+    if (this.cookie && failedCookie && this.cookie !== failedCookie) {
+      // Another concurrent call already refreshed the session cookie.
+      return;
+    }
+    this.cookie = null;
+    this.tenantId = null;
+    this.humanActorId = null;
+    await this.sessionStore.clear();
+    await this.ensureSession();
+  }
+
   private async resolveOrLogin(): Promise<void> {
+    await this.verifyLocalIdentity();
+
     if (!this.cookie) {
-      const cached = await this.sessionStore.load(this.config.baseUrl);
+      const cached = await this.sessionStore.load(this.config.baseUrl, this.config.email);
       if (cached) {
-        this.cookie = cached.cookie;
-        this.tenantId = cached.tenantId ?? null;
-        this.humanActorId = cached.humanActorId ?? null;
-        if (this.tenantId) {
+        if (cached.tenantId) {
+          this.cookie = cached.cookie;
+          this.tenantId = cached.tenantId;
+          this.humanActorId = cached.humanActorId ?? null;
           return;
         }
+        // Query /v0/me directly via rawFetch to avoid re-entering ensureSession() on 401.
         try {
-          const me = await this.fetchWithAuth<CurrentIdentity>("GET", "/v0/me");
-          const actor = me.actors[0];
-          if (actor) {
-            this.tenantId = actor.tenant_id;
-            this.humanActorId = actor.id;
-            await this.sessionStore.save({
-              ...cached,
-              tenantId: actor.tenant_id,
-              humanActorId: actor.id,
-            });
-            return;
+          const meResp = await this.rawFetch("/v0/me", {
+            method: "GET",
+            headers: { Cookie: cached.cookie },
+          });
+          if (meResp.ok) {
+            const me = (await meResp.json()) as CurrentIdentity;
+            const actor = me.actors.find((a) => a.kind === "human") ?? me.actors[0];
+            if (actor?.tenant_id) {
+              this.cookie = cached.cookie;
+              this.tenantId = actor.tenant_id;
+              this.humanActorId = actor.id;
+              await this.sessionStore.save({
+                ...cached,
+                tenantId: actor.tenant_id,
+                humanActorId: actor.id,
+              });
+              return;
+            }
           }
         } catch {
-          this.cookie = null;
-          this.tenantId = null;
-          this.humanActorId = null;
-          await this.sessionStore.clear();
+          // Fall through to full login.
         }
+        await this.sessionStore.clear();
       }
     }
 
@@ -191,7 +222,7 @@ export class LingerClient {
       throw new Error("Login succeeded but server did not return teamhub_session Set-Cookie");
     }
     const session = (await response.json()) as Session;
-    const actor = session.identity.actors[0];
+    const actor = session.identity.actors.find((a) => a.kind === "human") ?? session.identity.actors[0];
     if (!actor?.tenant_id) {
       throw new Error("Login succeeded but account has no active Human Actor / Tenant");
     }
@@ -202,6 +233,7 @@ export class LingerClient {
 
     await this.sessionStore.save({
       baseUrl: this.config.baseUrl,
+      email,
       cookie: sessionCookie,
       expiresAt: session.expires_at,
       tenantId: actor.tenant_id,
@@ -212,6 +244,7 @@ export class LingerClient {
   private async rawFetch(path: string, init: RequestInit): Promise<Response> {
     return fetch(`${this.config.baseUrl}${path}`, {
       ...init,
+      redirect: "error",
       signal: AbortSignal.timeout(this.config.requestTimeoutMs),
     });
   }
@@ -234,10 +267,11 @@ export class LingerClient {
     } catch {
       // Fall through to status text.
     }
+    const safeText = rawText.slice(0, 500) || response.statusText || `HTTP ${response.status}`;
     return new LingerApiError(
       response.status,
       `HTTP_${response.status}`,
-      rawText || response.statusText || `HTTP ${response.status}`,
+      safeText,
       Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : undefined
     );
   }
@@ -248,13 +282,12 @@ export class LingerClient {
     options?: { body?: unknown; headers?: Record<string, string>; rawBinary?: boolean },
     retriedAfter401: boolean = false
   ): Promise<T> {
-    if (!this.cookie) {
-      await this.ensureSession();
-    }
+    await this.ensureSession();
+    const usedCookie = this.cookie;
 
     const headers: Record<string, string> = {
       ...(options?.headers ?? {}),
-      Cookie: this.cookie as string,
+      Cookie: usedCookie as string,
     };
     let encodedBody: string | undefined;
     if (options?.body !== undefined) {
@@ -269,11 +302,7 @@ export class LingerClient {
     });
 
     if (response.status === 401 && !retriedAfter401) {
-      this.cookie = null;
-      this.tenantId = null;
-      this.humanActorId = null;
-      await this.sessionStore.clear();
-      await this.ensureSession();
+      await this.refreshSessionAfter401(usedCookie);
       return this.fetchWithAuth<T>(method, path, options, true);
     }
 
@@ -308,14 +337,14 @@ export class LingerClient {
     const tenantId = await this.requireTenantId();
     const items: TenantAgent[] = [];
     let cursor: string | undefined;
-    for (let page = 0; page < 10; page++) {
+    for (let page = 0; page < 50; page++) {
       const qs = new URLSearchParams({ limit: "200" });
       if (cursor) {
         qs.set("cursor", cursor);
       }
       const res = await this.fetchWithAuth<TenantAgentPage>("GET", `/v0/tenants/${encodeURIComponent(tenantId)}/agents?${qs}`);
       items.push(...res.items);
-      if (!res.page.has_more || !res.page.next_cursor) {
+      if (!res.page.has_more || !res.page.next_cursor || res.page.next_cursor === cursor) {
         break;
       }
       cursor = res.page.next_cursor;
@@ -327,7 +356,7 @@ export class LingerClient {
     const tenantId = await this.requireTenantId();
     const items: TenantAgentAvailabilitySnapshot[] = [];
     let cursor: string | undefined;
-    for (let page = 0; page < 10; page++) {
+    for (let page = 0; page < 50; page++) {
       const qs = new URLSearchParams({ limit: "200" });
       if (cursor) {
         qs.set("cursor", cursor);
@@ -337,7 +366,7 @@ export class LingerClient {
         `/v0/tenants/${encodeURIComponent(tenantId)}/agent-availability?${qs}`
       );
       items.push(...res.items);
-      if (!res.page.has_more || !res.page.next_cursor) {
+      if (!res.page.has_more || !res.page.next_cursor || res.page.next_cursor === cursor) {
         break;
       }
       cursor = res.page.next_cursor;
@@ -350,19 +379,40 @@ export class LingerClient {
     const bounded = Math.max(1, Math.min(200, limit));
     const items: RoomListItem[] = [];
     let cursor: string | undefined;
-    for (let page = 0; page < 5; page++) {
+    for (let page = 0; page < 20; page++) {
       const qs = new URLSearchParams({ limit: String(bounded) });
       if (cursor) {
         qs.set("cursor", cursor);
       }
       const res = await this.fetchWithAuth<RoomPage>("GET", `/v0/tenants/${encodeURIComponent(tenantId)}/rooms?${qs}`);
       items.push(...res.items);
-      if (!res.page.has_more || !res.page.next_cursor || items.length >= bounded) {
+      if (!res.page.has_more || !res.page.next_cursor || items.length >= bounded || res.page.next_cursor === cursor) {
         break;
       }
       cursor = res.page.next_cursor;
     }
     return items.slice(0, bounded);
+  }
+
+  private async findRoomByName(roomName: string): Promise<RoomListItem | undefined> {
+    const tenantId = await this.requireTenantId();
+    let cursor: string | undefined;
+    for (let page = 0; page < 50; page++) {
+      const qs = new URLSearchParams({ limit: "200" });
+      if (cursor) {
+        qs.set("cursor", cursor);
+      }
+      const res = await this.fetchWithAuth<RoomPage>("GET", `/v0/tenants/${encodeURIComponent(tenantId)}/rooms?${qs}`);
+      const match = res.items.find((room) => room.kind === "room" && room.name === roomName);
+      if (match) {
+        return match;
+      }
+      if (!res.page.has_more || !res.page.next_cursor || res.page.next_cursor === cursor) {
+        break;
+      }
+      cursor = res.page.next_cursor;
+    }
+    return undefined;
   }
 
   async createRoom(name: string, description?: string): Promise<Room> {
@@ -380,17 +430,15 @@ export class LingerClient {
   }
 
   async ensureBridgeRoom(roomName: string): Promise<Room> {
-    const existing = await this.listRooms(200);
-    const match = existing.find((room) => room.kind === "room" && room.name === roomName);
-    if (match) {
-      return match;
+    const existing = await this.findRoomByName(roomName);
+    if (existing) {
+      return existing;
     }
     try {
       return await this.createRoom(roomName, "Bridge room for Codex MCP agent calls");
     } catch (err) {
       if (err instanceof LingerApiError && err.status === 409 && err.code === "ROOM_NAME_TAKEN") {
-        const refreshed = await this.listRooms(200);
-        const found = refreshed.find((room) => room.kind === "room" && room.name === roomName);
+        const found = await this.findRoomByName(roomName);
         if (found) {
           return found;
         }
@@ -407,12 +455,23 @@ export class LingerClient {
     if (segments.length === 0) {
       throw new Error("Message must include at least one segment");
     }
+    for (const segment of segments) {
+      if (typeof segment.content !== "string" || segment.content.length === 0) {
+        throw new Error("Every message segment must have non-empty content");
+      }
+    }
     // TeamHub strictly validates that raw_message equals concatenated segment contents.
     const rawMessage = segments.map((segment) => segment.content).join("");
     if (!rawMessage.trim()) {
       throw new Error("Message raw_message must not be blank");
     }
+    if ([...rawMessage].length > MAX_MESSAGE_RUNES) {
+      throw new Error(`Message exceeds TeamHub limit of ${MAX_MESSAGE_RUNES} characters`);
+    }
     const key = idempotencyKey ?? `mcp-${randomUUID()}`;
+    if (!IDEMPOTENCY_KEY_RE.test(key)) {
+      throw new Error("Invalid Idempotency-Key format");
+    }
     return this.fetchWithAuth<Message>("POST", `/v0/rooms/${encodeURIComponent(roomId)}/messages`, {
       headers: { "Idempotency-Key": key },
       body: { raw_message: rawMessage, segments },
@@ -446,11 +505,11 @@ export class LingerClient {
     return this.fetchWithAuth<RoomRunStatusList>("GET", `/v0/rooms/${encodeURIComponent(roomId)}/run-statuses`);
   }
 
-  async cancelRun(roomId: string, runId: string, reason?: string): Promise<unknown> {
-    return this.fetchWithAuth<unknown>(
+  async cancelRun(roomId: string, runId: string): Promise<RoomRunCancelResult> {
+    return this.fetchWithAuth<RoomRunCancelResult>(
       "POST",
       `/v0/rooms/${encodeURIComponent(roomId)}/runs/${encodeURIComponent(runId)}/cancel`,
-      { body: reason ? { reason } : {} }
+      { body: { request_id: `mcp-${randomUUID()}` } }
     );
   }
 
@@ -468,9 +527,6 @@ export class LingerClient {
     };
     if (request.comment && request.comment.trim() !== "") {
       payload.comment = request.comment.trim();
-    }
-    if (request.connection_id) {
-      payload.connection_id = request.connection_id;
     }
     if (request.answers) {
       payload.answers = request.answers;

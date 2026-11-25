@@ -26,6 +26,42 @@ function parseList(raw: string | undefined, fallback: string[]): string[] {
     .filter((item) => item.length > 0);
 }
 
+/** Splits comma-delimited regex strings without breaking `{m,n}` quantifiers. */
+function splitCommaOutsideBraces(raw: string): string[] {
+  const parts: string[] = [];
+  let braceDepth = 0;
+  let escaped = false;
+  let current = "";
+  for (const ch of raw) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      current += ch;
+      escaped = true;
+      continue;
+    }
+    if (ch === "{") {
+      braceDepth++;
+    } else if (ch === "}" && braceDepth > 0) {
+      braceDepth--;
+    } else if (ch === "," && braceDepth === 0) {
+      if (current.trim()) {
+        parts.push(current.trim());
+      }
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  if (current.trim()) {
+    parts.push(current.trim());
+  }
+  return parts;
+}
+
 function parseDenyPatterns(raw: string | undefined): RegExp[] {
   if (!raw || !raw.trim()) {
     return [];
@@ -44,10 +80,7 @@ function parseDenyPatterns(raw: string | undefined): RegExp[] {
     }
     patterns = parsed;
   } else {
-    patterns = trimmed
-      .split(",")
-      .map((item) => item.trim())
-      .filter((item) => item.length > 0);
+    patterns = splitCommaOutsideBraces(trimmed);
   }
   return patterns.map((pattern) => {
     try {
@@ -83,6 +116,11 @@ function parseBool(raw: string | undefined, fallback: boolean): boolean {
   throw new Error(`Invalid boolean value: ${raw}`);
 }
 
+function isLoopbackHost(hostname: string): boolean {
+  const bare = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  return bare === "localhost" || bare === "127.0.0.1" || bare === "::1";
+}
+
 export function parseConfig(env: NodeJS.ProcessEnv = process.env): LingerMcpConfig {
   const rawUrl = env.LINGER_URL?.trim();
   if (!rawUrl) {
@@ -92,12 +130,33 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): LingerMcpConf
   try {
     parsedUrl = new URL(rawUrl);
   } catch {
-    throw new Error(`LINGER_URL is not a valid URL: ${rawUrl}`);
+    throw new Error("LINGER_URL is not a valid URL");
   }
   if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
-    throw new Error(`LINGER_URL must use http or https scheme: ${rawUrl}`);
+    throw new Error(`LINGER_URL must use http or https scheme, got "${parsedUrl.protocol}"`);
+  }
+  if (parsedUrl.username || parsedUrl.password) {
+    throw new Error("LINGER_URL must not embed username or password credentials");
+  }
+  const allowInsecureHttp = parseBool(env.LINGER_ALLOW_INSECURE_HTTP, false);
+  if (parsedUrl.protocol === "http:" && !isLoopbackHost(parsedUrl.hostname) && !allowInsecureHttp) {
+    throw new Error(
+      `LINGER_URL uses cleartext http for non-loopback host "${parsedUrl.hostname}". Use https:// or set LINGER_ALLOW_INSECURE_HTTP=true.`
+    );
   }
   const baseUrl = parsedUrl.toString().replace(/\/+$/, "");
+
+  let localIdentityOrigin: string | undefined;
+  const rawOrigin = env.LINGER_LOCAL_IDENTITY_ORIGIN?.trim();
+  if (rawOrigin) {
+    let parsedOrigin: URL;
+    try {
+      parsedOrigin = new URL(rawOrigin);
+    } catch {
+      throw new Error(`LINGER_LOCAL_IDENTITY_ORIGIN is not a valid URL: ${rawOrigin}`);
+    }
+    localIdentityOrigin = parsedOrigin.origin;
+  }
 
   const roomModeRaw = (env.LINGER_ROOM_MODE ?? "bridge").trim().toLowerCase();
   if (roomModeRaw !== "bridge" && roomModeRaw !== "direct") {
@@ -121,6 +180,7 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): LingerMcpConf
     keychainService: env.LINGER_KEYCHAIN_SERVICE?.trim() || undefined,
     sessionFile,
     localIdentityKey: env.LINGER_LOCAL_IDENTITY_KEY?.trim() || undefined,
+    localIdentityOrigin,
     roomMode,
     bridgeRoomName: env.LINGER_BRIDGE_ROOM_NAME?.trim() || "Codex Bridge",
     approvalPolicy: {
@@ -129,7 +189,7 @@ export function parseConfig(env: NodeJS.ProcessEnv = process.env): LingerMcpConf
       allowedCommandPrefixes: parseList(env.LINGER_APPROVAL_ALLOW_CMD_PREFIXES, DEFAULT_ALLOW_CMD_PREFIXES),
       denyPatterns: parseDenyPatterns(env.LINGER_APPROVAL_DENY_PATTERNS),
       allowGuiAutoApprove: parseBool(env.LINGER_ALLOW_GUI_APPROVAL, false),
-      allowHumanConfirmedRelay: parseBool(env.LINGER_ALLOW_HUMAN_CONFIRMED_RELAY, true),
+      allowHumanConfirmedRelay: parseBool(env.LINGER_ALLOW_HUMAN_CONFIRMED_RELAY, approvalMode === "relay"),
     },
     pollIntervalMs: parseIntInRange(env.LINGER_POLL_INTERVAL_MS, 1500, 100, 30_000, "LINGER_POLL_INTERVAL_MS"),
     defaultWaitSeconds: parseIntInRange(env.LINGER_DEFAULT_WAIT_SECONDS, 25, 0, 300, "LINGER_DEFAULT_WAIT_SECONDS"),

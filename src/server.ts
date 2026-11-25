@@ -66,7 +66,7 @@ export function createLingerMcpServer(client: LingerClient, jobs: JobManager): M
         "Send a task or question to a Linger agent. Waits up to wait_seconds for completion; if still running or blocked on an approval/question card, returns job_id and pending_cards so you can inspect/decide or call linger_get_reply.",
       inputSchema: {
         agent: z.string().min(1).describe("Agent actor_id or display_name from linger_list_agents"),
-        prompt: z.string().min(1).describe("Task instruction or question for the Linger agent"),
+        prompt: z.string().min(1).max(49_000).describe("Task instruction or question for the Linger agent"),
         room_id: z.string().min(1).optional().describe("Optional existing Linger room ID to reuse"),
         room_mode: z.enum(["bridge", "direct"]).optional().describe("Override default room mode (bridge or direct)"),
         wait_seconds: z.number().int().min(0).max(300).optional().describe("Max seconds to wait before returning async job_id"),
@@ -121,10 +121,9 @@ export function createLingerMcpServer(client: LingerClient, jobs: JobManager): M
           .record(z.union([z.string(), z.array(z.string())]))
           .optional()
           .describe("Map of question.id to chosen option id(s) or custom text when decision='submit'"),
-        connection_id: z.string().min(1).optional().describe("Connection ID for connection_auth if applicable"),
         human_confirmed: z.boolean().optional().describe("Set true only when the human explicitly confirmed a relayed high-risk card in Codex"),
-        room_id: z.string().min(1).optional().describe("Optional room_id for uncached card lookup"),
-        message_id: z.string().min(1).optional().describe("Optional message_id for uncached card lookup"),
+        room_id: z.string().min(1).optional().describe("Room ID for uncached card inspection"),
+        message_id: z.string().min(1).optional().describe("Message ID for uncached card inspection"),
       },
     },
     async (args) => {
@@ -135,7 +134,6 @@ export function createLingerMcpServer(client: LingerClient, jobs: JobManager): M
           decision: args.decision,
           comment: args.comment,
           answers: args.answers,
-          connectionId: args.connection_id,
           humanConfirmed: args.human_confirmed,
           roomId: args.room_id,
           messageId: args.message_id,
@@ -191,12 +189,11 @@ export function createLingerMcpServer(client: LingerClient, jobs: JobManager): M
       description: "Request cancellation of the active Linger Agent Run associated with a job_id.",
       inputSchema: {
         job_id: z.string().min(1).describe("Job ID to cancel"),
-        reason: z.string().min(1).max(500).optional().describe("Optional cancellation reason"),
       },
     },
     async (args) => {
       try {
-        const result = await jobs.cancelJob(args.job_id, args.reason);
+        const result = await jobs.cancelJob(args.job_id);
         return jsonResult(result);
       } catch (err) {
         return errorResult(err);
