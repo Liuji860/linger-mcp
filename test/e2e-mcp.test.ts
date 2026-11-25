@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -32,6 +32,16 @@ class MockTeamHubServer {
   readonly decisions = new Map<string, { messageId: string; roomId: string; card: Record<string, unknown> }>();
   readonly canceledRuns: string[] = [];
   readonly idempotencySeen = new Set<string>();
+  readonly documents = new Map<
+    string,
+    {
+      meta: Record<string, unknown>;
+      filename: string;
+      mediaType: string;
+      bytes: Buffer;
+      retry202Once?: boolean;
+    }
+  >();
 
   constructor() {
     this.server = createServer((req, res) => {
@@ -65,8 +75,17 @@ class MockTeamHubServer {
     return roomSeq;
   }
 
-  private appendAgentMessage(roomId: string, text: string, card?: Record<string, unknown>): StoredMessage {
+  private appendAgentMessage(
+    roomId: string,
+    text: string,
+    card?: Record<string, unknown>,
+    extras?: {
+      segments?: Array<Record<string, unknown>>;
+      attachments?: Array<Record<string, unknown>>;
+    }
+  ): StoredMessage {
     const id = `msg_${++this.seq}`;
+    const segments = extras?.segments ?? [{ type: "text", content: text }];
     const msg: StoredMessage = {
       id,
       tenant_id: "tenant_1",
@@ -74,8 +93,8 @@ class MockTeamHubServer {
       author: { id: "agent_opu", tenant_id: "tenant_1", kind: "agent", display_name: "opu" },
       message_kind: "conversation",
       raw_message: text,
-      segments: [{ type: "text", content: text }],
-      attachments: [],
+      segments,
+      attachments: extras?.attachments ?? [],
       card,
       created_at: new Date().toISOString(),
     };
@@ -230,12 +249,155 @@ class MockTeamHubServer {
         kind: "computer_permission",
         title: "Screen Recording",
         status: "pending",
-        computer_permission: {
-          computer_id: "comp_1",
-          subject: "Linger",
-          permissions: ["screen_recording"],
+          computer_permission: {
+            computer_id: "comp_1",
+            subject: "Linger",
+            permissions: ["screen_recording"],
+          },
+        });
+      return;
+    }
+
+    if (prompt.includes("SCENARIO_DOC_INLINE")) {
+      const docId = "doc_bk_small";
+      const body = Buffer.from("# Linger MCP 调研结论\n- Linger 是 MCP 宿主客户端\n- 通过 /v0 HTTP API 可安全桥接");
+      this.documents.set(docId, {
+        filename: "linger-mcp-research.md",
+        mediaType: "text/markdown",
+        bytes: body,
+        retry202Once: true,
+        meta: {
+          id: docId,
+          tenant_id: "tenant_1",
+          title: "Linger MCP 调研报告",
+          format: "native",
+          representation_format: "markdown",
+          status: "active",
+          current_version: null,
+          draft_capability: "read",
+          can_edit_native_content: true,
+          capabilities: { read: true, write: false, manage: false, delete: false, duplicate: true, export: true, comment: true, use_as_context: true },
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
         },
       });
+      this.appendAgentMessage(roomId, "调研已完成，详见文档卡片：Linger MCP 调研报告", undefined, {
+        segments: [
+          { type: "text", content: "调研已完成，详见文档卡片：" },
+          { type: "document", content: "Linger MCP 调研报告", document_id: docId, presentation: "card" },
+        ],
+      });
+      this.emitRunStatus(roomId, runId, "completed", true);
+      return;
+    }
+
+    if (prompt.includes("SCENARIO_DOC_TRUNCATED")) {
+      const docId = "doc_bk_huge";
+      const content = `${"A".repeat(1100)}TAIL_MARKER`;
+      this.documents.set(docId, {
+        filename: "huge-report.md",
+        mediaType: "text/markdown",
+        bytes: Buffer.from(content),
+        meta: {
+          id: docId,
+          tenant_id: "tenant_1",
+          title: "超长调研报告",
+          format: "native",
+          representation_format: "markdown",
+          status: "active",
+          current_version: null,
+          draft_capability: "read",
+          can_edit_native_content: true,
+          capabilities: { read: true, write: false, manage: false, delete: false, duplicate: true, export: true, comment: true, use_as_context: true },
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        },
+      });
+      this.appendAgentMessage(roomId, "完整超长报告已生成超长调研报告", undefined, {
+        segments: [
+          { type: "text", content: "完整超长报告已生成" },
+          { type: "document", content: "超长调研报告", document_id: docId, presentation: "card" },
+        ],
+      });
+      this.emitRunStatus(roomId, runId, "completed", true);
+      return;
+    }
+
+    if (prompt.includes("SCENARIO_BINARY_ATT")) {
+      const docId = "doc_bin_pdf";
+      const binBytes = Buffer.from([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37, 0x00, 0x42, 0x49, 0x4e]);
+      this.documents.set(docId, {
+        filename: "architecture.pdf",
+        mediaType: "application/pdf",
+        bytes: binBytes,
+        meta: {
+          id: docId,
+          tenant_id: "tenant_1",
+          title: "architecture.pdf",
+          format: "file",
+          representation_format: "binary",
+          status: "active",
+          current_version: { id: "ver_bin_1", version_number: 1, sha256: "c".repeat(64) },
+          draft_capability: "none",
+          can_edit_native_content: false,
+          capabilities: { read: true, write: false, manage: false, delete: false, duplicate: true, export: true, comment: true, use_as_context: true },
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        },
+      });
+      this.appendAgentMessage(roomId, "架构 PDF 附件已上传", undefined, {
+        segments: [{ type: "text", content: "架构 PDF 附件已上传" }],
+        attachments: [
+          {
+            id: "att_pdf",
+            document_id: docId,
+            document_version_id: "ver_bin_1",
+            filename: "architecture.pdf",
+            media_type: "application/pdf",
+            size_bytes: binBytes.length,
+            sha256: "c".repeat(64),
+            available: true,
+          },
+        ],
+      });
+      this.emitRunStatus(roomId, runId, "completed", true);
+      return;
+    }
+
+    if (prompt.includes("SCENARIO_FOLLOWUP_ASYNC")) {
+      this.appendAgentMessage(roomId, "收到，我先启动后台任务深入查一下。");
+      this.emitRunStatus(roomId, runId, "completed", true);
+      setTimeout(() => {
+        const followupRunId = `run_followup_${++this.seq}`;
+        const docId = "doc_followup_1";
+        this.documents.set(docId, {
+          filename: "followup.md",
+          mediaType: "text/markdown",
+          bytes: Buffer.from("## 后台异步补充结论\n实测验证完成。"),
+          meta: {
+            id: docId,
+            tenant_id: "tenant_1",
+            title: "后台调研报告",
+            format: "native",
+            representation_format: "markdown",
+            status: "active",
+            current_version: null,
+            draft_capability: "read",
+            can_edit_native_content: true,
+            capabilities: { read: true, write: false, manage: false, delete: false, duplicate: true, export: true, comment: true, use_as_context: true },
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          },
+        });
+        this.emitRunStatus(roomId, followupRunId, "active", false);
+        this.appendAgentMessage(roomId, "后台任务完成：后台调研报告", undefined, {
+          segments: [
+            { type: "text", content: "后台任务完成：" },
+            { type: "document", content: "后台调研报告", document_id: docId, presentation: "card" },
+          ],
+        });
+        this.emitRunStatus(roomId, followupRunId, "completed", true);
+      }, 220);
       return;
     }
   }
@@ -511,6 +673,62 @@ class MockTeamHubServer {
       return;
     }
 
+    const docMetaMatch = /^\/v0\/documents\/([^/]+)$/.exec(path);
+    if (docMetaMatch && req.method === "GET") {
+      const docId = decodeURIComponent(docMetaMatch[1] as string);
+      const entry = this.documents.get(docId);
+      if (!entry) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { code: "NOT_FOUND", message: "missing doc", request_id: "r_doc" } }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(entry.meta));
+      return;
+    }
+
+    const docDlMatch = /^\/v0\/documents\/([^/]+)\/downloads$/.exec(path);
+    if (docDlMatch && req.method === "GET") {
+      const docId = decodeURIComponent(docDlMatch[1] as string);
+      const entry = this.documents.get(docId);
+      if (!entry) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: { code: "NOT_FOUND", message: "missing doc", request_id: "r_doc_dl" } }));
+        return;
+      }
+      if (entry.retry202Once) {
+        entry.retry202Once = false;
+        res.writeHead(202, { "Content-Type": "application/json", "Retry-After": "1" });
+        res.end(JSON.stringify({ error: { code: "RENDERING", message: "rendering", request_id: "r_202" } }));
+        return;
+      }
+      res.writeHead(200, {
+        "Content-Type": entry.mediaType,
+        "Content-Disposition": `attachment; filename="${entry.filename}"`,
+      });
+      res.end(entry.bytes);
+      return;
+    }
+
+    const docVerMatch = /^\/v0\/document-versions\/([^/]+)\/content$/.exec(path);
+    if (docVerMatch && req.method === "GET") {
+      const verId = decodeURIComponent(docVerMatch[1] as string);
+      for (const entry of this.documents.values()) {
+        const curVer = entry.meta.current_version as { id?: string } | null;
+        if (curVer?.id === verId) {
+          res.writeHead(200, {
+            "Content-Type": entry.mediaType,
+            "Content-Disposition": `attachment; filename="${entry.filename}"`,
+          });
+          res.end(entry.bytes);
+          return;
+        }
+      }
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+
     res.writeHead(404);
     res.end();
   }
@@ -524,6 +742,7 @@ function parseToolJson(result: { content: Array<{ type: string; text?: string }>
 test("Stdio MCP Server E2E flows with opu tiered approval policy", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "linger-e2e-"));
   const sessionFile = join(tempDir, "session.json");
+  const downloadDir = join(tempDir, "downloads");
   const mock = new MockTeamHubServer();
   await mock.start();
 
@@ -537,6 +756,8 @@ test("Stdio MCP Server E2E flows with opu tiered approval policy", async () => {
       LINGER_EMAIL: "liubo@example.com",
       LINGER_PASSWORD: "demo-password",
       LINGER_SESSION_FILE: sessionFile,
+      LINGER_DOWNLOAD_DIR: downloadDir,
+      LINGER_INLINE_DOCUMENT_MAX_CHARS: "1024",
       LINGER_POLL_INTERVAL_MS: "100",
       LINGER_DEFAULT_WAIT_SECONDS: "2",
       LINGER_APPROVAL_MODE: "tiered",
@@ -732,6 +953,85 @@ test("Stdio MCP Server E2E flows with opu tiered approval policy", async () => {
       (await client.callTool({ name: "linger_read_room", arguments: { room_id: highRisk.room_id, limit: 5 } })) as never
     );
     assert.ok(Array.isArray(readRoomRes.items));
+
+    // 9. Document card auto-inlines small Markdown content in a single call (including 202 retry)
+    const docInlined = parseToolJson(
+      (await client.callTool({
+        name: "linger_ask_agent",
+        arguments: { agent: "opu", prompt: "SCENARIO_DOC_INLINE", wait_seconds: 5 },
+      })) as never
+    );
+    assert.equal(docInlined.status, "completed");
+    const inlinedDocs = docInlined.documents as Array<Record<string, unknown>>;
+    assert.equal(inlinedDocs.length, 1);
+    assert.equal(inlinedDocs[0]?.status, "inlined");
+    assert.match(inlinedDocs[0]?.content as string, /Linger MCP 调研结论/);
+
+    // 10. Truncated large document prompts hint + linger_read_document pagination retrieves full tail
+    const docTrunc = parseToolJson(
+      (await client.callTool({
+        name: "linger_ask_agent",
+        arguments: { agent: "opu", prompt: "SCENARIO_DOC_TRUNCATED", wait_seconds: 5 },
+      })) as never
+    );
+    const truncDocs = docTrunc.documents as Array<Record<string, unknown>>;
+    assert.equal(truncDocs[0]?.status, "truncated");
+    assert.equal(truncDocs[0]?.next_offset, 1024);
+    assert.match(docTrunc.hint as string, /linger_read_document/);
+
+    const tailRead = parseToolJson(
+      (await client.callTool({
+        name: "linger_read_document",
+        arguments: { document_id: "doc_bk_huge", offset: 1024, max_chars: 1024 },
+      })) as never
+    );
+    assert.match(tailRead.content as string, /TAIL_MARKER$/);
+    assert.equal(tailRead.has_more, false);
+
+    // 11. Binary attachment marks status="binary" and save_to_file persists a 0600 local copy
+    const binRes = parseToolJson(
+      (await client.callTool({
+        name: "linger_ask_agent",
+        arguments: { agent: "opu", prompt: "SCENARIO_BINARY_ATT", wait_seconds: 5 },
+      })) as never
+    );
+    const binDocs = binRes.documents as Array<Record<string, unknown>>;
+    assert.equal(binDocs[0]?.status, "binary");
+
+    const savedBinRes = parseToolJson(
+      (await client.callTool({
+        name: "linger_read_document",
+        arguments: { document_id: "doc_bin_pdf", save_to_file: true },
+      })) as never
+    );
+    assert.equal(savedBinRes.is_binary, true);
+    assert.ok(typeof savedBinRes.saved_path === "string");
+    const binStats = await stat(savedBinRes.saved_path as string);
+    assert.equal(binStats.mode & 0o777, 0o600);
+    assert.equal((await readFile(savedBinRes.saved_path as string)).slice(0, 8).toString("utf8"), "%PDF-1.7");
+
+    // 12. Follow-up async delivery on an already-completed job is captured via wait_for_followup=true
+    const initialDone = parseToolJson(
+      (await client.callTool({
+        name: "linger_ask_agent",
+        arguments: { agent: "opu", prompt: "SCENARIO_FOLLOWUP_ASYNC", wait_seconds: 2 },
+      })) as never
+    );
+    assert.equal(initialDone.status, "completed");
+    assert.match(initialDone.reply_text as string, /先启动后台任务/);
+
+    const followupDone = parseToolJson(
+      (await client.callTool({
+        name: "linger_get_reply",
+        arguments: { job_id: initialDone.job_id, wait_seconds: 5, wait_for_followup: true },
+      })) as never
+    );
+    assert.equal(followupDone.status, "completed");
+    assert.match(followupDone.reply_text as string, /后台任务完成/);
+    const followupDocs = followupDone.documents as Array<Record<string, unknown>>;
+    assert.equal(followupDocs.length, 1);
+    assert.equal(followupDocs[0]?.status, "inlined");
+    assert.match(followupDocs[0]?.content as string, /后台异步补充结论/);
   } finally {
     await client.close().catch(() => undefined);
     await mock.stop();
