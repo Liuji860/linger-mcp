@@ -91,7 +91,7 @@ In default `bridge` mode, every task dispatch, follow-up prompt, online Document
     </td>
     <td align="center" width="33%">
       <a href="./docs/posters/06-quickstart.png"><img src="./docs/posters/06-quickstart.png" width="280" alt="06 3-Step Quick Start" /></a><br />
-      <sub><b>06 Quick Start</b> · 3 Steps & 7 Tools</sub>
+      <sub><b>06 Quick Start</b> · 3 Steps & 8 Tools</sub>
     </td>
   </tr>
 </table>
@@ -128,7 +128,7 @@ sequenceDiagram
   A->>T: agent_run.status_changed (completed / aborted)
   opt Reply references Linger document cards or attachments
     M->>T: GET /v0/documents/{id} & /downloads
-    T-->>M: Export Markdown/text body (auto-inlined up to 32KB)
+    T-->>M: Export Markdown/text body (auto-inlined up to 32K chars)
   end
   M-->>C: Aggregate reply text, inlined documents, and auto-approval audit log
 ```

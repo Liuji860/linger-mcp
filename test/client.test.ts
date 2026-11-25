@@ -181,8 +181,29 @@ test("LingerClient login, 0600 cache, /v0/me 401 recovery, concurrent 401 safety
       return;
     }
 
+    if (req.method === "GET" && url === "/v0/document-versions/ver_1") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          id: "ver_1",
+          document_id: "doc_1",
+          version_number: 1,
+          filename: "v1.txt",
+          representation_format: "plain_text",
+          media_type: "text/plain",
+          size_bytes: 22,
+          sha256: "b".repeat(64),
+          created_at: new Date().toISOString(),
+        })
+      );
+      return;
+    }
+
     if (req.method === "GET" && url === "/v0/document-versions/ver_1/content") {
-      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.writeHead(200, {
+        "Content-Type": "text/plain",
+        "Content-Disposition": 'attachment; x-filename="evil"; filename="report \\"Q1\\".txt"',
+      });
       res.end("immutable version body");
       return;
     }
@@ -303,7 +324,10 @@ test("LingerClient login, 0600 cache, /v0/me 401 recovery, concurrent 401 safety
     assert.equal(dl.sha256, "b".repeat(64));
     assert.equal(dl.bytes.toString("utf8"), "# 调研结论\n支持自动内联。");
 
+    const verMeta = await docClient.getDocumentVersion("ver_1");
+    assert.equal(verMeta.document_id, "doc_1");
     const verDl = await docClient.downloadDocumentVersion("ver_1");
+    assert.equal(verDl.filename, 'report "Q1".txt');
     assert.equal(verDl.bytes.toString("utf8"), "immutable version body");
 
     await assert.rejects(

@@ -5,6 +5,7 @@ import type {
   DecisionRequest,
   DocumentDownloadResult,
   DocumentMetadata,
+  DocumentVersionMetadata,
   LingerMcpConfig,
   Message,
   MessagePage,
@@ -26,6 +27,7 @@ const IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
 const LOCAL_IDENTITY_PROOF_RE = /^[A-Za-z0-9_-]{43}$/;
 const MAX_MESSAGE_RUNES = 50_000;
 const MAX_202_RETRIES = 3;
+const MAX_ERROR_BODY_BYTES = 65_536;
 
 function sleepMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -35,7 +37,7 @@ function parseContentDispositionFilename(header: string | null): string | undefi
   if (!header) {
     return undefined;
   }
-  const starMatch = /filename\*\s*=\s*(?:UTF-8|utf-8)''([^;\r\n]+)/i.exec(header);
+  const starMatch = /(?:^|;)\s*filename\*\s*=\s*(?:UTF-8|utf-8)''([^;\r\n]+)/i.exec(header);
   if (starMatch?.[1]) {
     try {
       const decoded = decodeURIComponent(starMatch[1].trim().replace(/^"|"$/g, ""));
@@ -46,11 +48,14 @@ function parseContentDispositionFilename(header: string | null): string | undefi
       // Fall through to plain filename parameter.
     }
   }
-  const quotedMatch = /filename\s*=\s*"([^"\r\n]+)"/i.exec(header);
-  if (quotedMatch?.[1]?.trim()) {
-    return quotedMatch[1].trim();
+  const quotedMatch = /(?:^|;)\s*filename\s*=\s*"((?:\\.|[^"\\\r\n])+)"/i.exec(header);
+  if (quotedMatch?.[1]) {
+    const unescaped = quotedMatch[1].replace(/\\(.)/g, "$1").trim();
+    if (unescaped) {
+      return unescaped;
+    }
   }
-  const bareMatch = /filename\s*=\s*([^;\s\r\n]+)/i.exec(header);
+  const bareMatch = /(?:^|;)\s*filename\s*=\s*([^;\s\r\n]+)/i.exec(header);
   if (bareMatch?.[1]?.trim()) {
     return bareMatch[1].trim();
   }
@@ -74,9 +79,13 @@ function parseSha256Header(headers: Headers): string | undefined {
   return undefined;
 }
 
-async function readBoundedResponseBody(response: Response, maxBytes: number): Promise<Buffer> {
+async function readBoundedResponseBody(
+  response: Response,
+  maxBytes: number,
+  truncateOnLimit: boolean = false
+): Promise<Buffer> {
   const contentLenRaw = response.headers.get("content-length");
-  if (contentLenRaw) {
+  if (contentLenRaw && !truncateOnLimit) {
     const declared = Number.parseInt(contentLenRaw, 10);
     if (Number.isFinite(declared) && declared > maxBytes) {
       await response.body?.cancel().catch(() => undefined);
@@ -103,8 +112,16 @@ async function readBoundedResponseBody(response: Response, maxBytes: number): Pr
       if (!value || value.byteLength === 0) {
         continue;
       }
-      total += value.byteLength;
-      if (total > maxBytes) {
+      if (total + value.byteLength > maxBytes) {
+        if (truncateOnLimit) {
+          const remaining = Math.max(0, maxBytes - total);
+          if (remaining > 0) {
+            chunks.push(Buffer.from(value.subarray(0, remaining)));
+            total += remaining;
+          }
+          await reader.cancel().catch(() => undefined);
+          break;
+        }
         await reader.cancel().catch(() => undefined);
         throw new LingerApiError(
           413,
@@ -112,6 +129,7 @@ async function readBoundedResponseBody(response: Response, maxBytes: number): Pr
           `Downloaded document exceeds limit (${maxBytes} bytes)`
         );
       }
+      total += value.byteLength;
       chunks.push(Buffer.from(value));
     }
   } finally {
@@ -163,6 +181,7 @@ export class LingerClient {
   private tenantId: string | null = null;
   private humanActorId: string | null = null;
   private loginPromise: Promise<void> | null = null;
+  private refreshPromise: Promise<void> | null = null;
   private localIdentityVerified = false;
 
   constructor(
@@ -216,6 +235,10 @@ export class LingerClient {
   }
 
   async ensureSession(): Promise<void> {
+    if (this.refreshPromise) {
+      await this.refreshPromise;
+      return;
+    }
     if (this.cookie && this.tenantId) {
       return;
     }
@@ -228,19 +251,35 @@ export class LingerClient {
   }
 
   private async refreshSessionAfter401(failedCookie: string | null): Promise<void> {
+    if (this.refreshPromise) {
+      await this.refreshPromise;
+      return;
+    }
     if (this.loginPromise) {
       await this.loginPromise;
-      return;
+      if (this.cookie && failedCookie && this.cookie !== failedCookie) {
+        return;
+      }
     }
     if (this.cookie && failedCookie && this.cookie !== failedCookie) {
       // Another concurrent call already refreshed the session cookie.
       return;
     }
-    this.cookie = null;
-    this.tenantId = null;
-    this.humanActorId = null;
-    await this.sessionStore.clear();
-    await this.ensureSession();
+    this.refreshPromise = (async () => {
+      this.cookie = null;
+      this.tenantId = null;
+      this.humanActorId = null;
+      await this.sessionStore.clear();
+      if (!this.loginPromise) {
+        this.loginPromise = this.resolveOrLogin().finally(() => {
+          this.loginPromise = null;
+        });
+      }
+      await this.loginPromise;
+    })().finally(() => {
+      this.refreshPromise = null;
+    });
+    await this.refreshPromise;
   }
 
   private async resolveOrLogin(): Promise<void> {
@@ -275,6 +314,8 @@ export class LingerClient {
               });
               return;
             }
+          } else {
+            await meResp.body?.cancel().catch(() => undefined);
           }
         } catch {
           // Fall through to full login.
@@ -315,6 +356,7 @@ export class LingerClient {
 
     const sessionCookie = extractSessionCookie(response.headers);
     if (!sessionCookie) {
+      await response.body?.cancel().catch(() => undefined);
       throw new Error("Login succeeded but server did not return teamhub_session Set-Cookie");
     }
     const session = (await response.json()) as Session;
@@ -346,9 +388,13 @@ export class LingerClient {
   }
 
   private async buildApiError(response: Response): Promise<LingerApiError> {
-    const retryAfterHeader = response.headers.get("retry-after");
-    const retryAfterSeconds = retryAfterHeader ? Number.parseInt(retryAfterHeader, 10) : undefined;
-    const rawText = await response.text().catch(() => "");
+    const retryAfterHeader = response.headers.get("retry-after")?.trim();
+    const retryAfterParsed =
+      retryAfterHeader && /^\d+$/.test(retryAfterHeader) ? Number.parseInt(retryAfterHeader, 10) : undefined;
+    const retryAfterSeconds =
+      retryAfterParsed !== undefined && retryAfterParsed >= 1 ? retryAfterParsed : undefined;
+    const rawBuf = await readBoundedResponseBody(response, MAX_ERROR_BODY_BYTES, true).catch(() => Buffer.alloc(0));
+    const rawText = rawBuf.toString("utf8");
     try {
       const parsed = JSON.parse(rawText) as ErrorBody;
       if (parsed.error?.message) {
@@ -448,7 +494,7 @@ export class LingerClient {
     }
 
     const bytes = await readBoundedResponseBody(response, options.maxBytes);
-    const filename = parseContentDispositionFilename(response.headers.get("content-disposition")) ?? "document";
+    const filename = parseContentDispositionFilename(response.headers.get("content-disposition"));
     return {
       filename,
       media_type: normalizeMediaType(response.headers.get("content-type")),
@@ -682,6 +728,13 @@ export class LingerClient {
 
   async getDocument(documentId: string): Promise<DocumentMetadata> {
     return this.fetchWithAuth<DocumentMetadata>("GET", `/v0/documents/${encodeURIComponent(documentId)}`);
+  }
+
+  async getDocumentVersion(documentVersionId: string): Promise<DocumentVersionMetadata> {
+    return this.fetchWithAuth<DocumentVersionMetadata>(
+      "GET",
+      `/v0/document-versions/${encodeURIComponent(documentVersionId)}`
+    );
   }
 
   async downloadLatestDocument(
