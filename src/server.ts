@@ -40,7 +40,7 @@ function errorResult(err: unknown) {
 export function createLingerMcpServer(client: LingerClient, jobs: JobManager): McpServer {
   const server = new McpServer({
     name: "linger-mcp",
-    version: "0.1.0",
+    version: "0.1.1",
   });
 
   server.registerTool(
@@ -63,13 +63,13 @@ export function createLingerMcpServer(client: LingerClient, jobs: JobManager): M
     "linger_ask_agent",
     {
       description:
-        "Send a task or question to a Linger agent. Waits up to wait_seconds for completion; if still running or blocked on an approval/question card, returns job_id and pending_cards so you can inspect/decide or call linger_get_reply.",
+        "Send a task or question to a Linger agent (pass display_name or actor_id directly when known). Waits up to wait_seconds (default 60s) for completion and automatically inlines readable text/Markdown document cards returned in the reply under documents. Use linger_read_document for truncated/large docs or binary files instead of asking the agent to re-paste text in chat.",
       inputSchema: {
-        agent: z.string().min(1).describe("Agent actor_id or display_name from linger_list_agents"),
+        agent: z.string().min(1).describe("Agent actor_id or display_name"),
         prompt: z.string().min(1).max(49_000).describe("Task instruction or question for the Linger agent"),
         room_id: z.string().min(1).optional().describe("Optional existing Linger room ID to reuse"),
         room_mode: z.enum(["bridge", "direct"]).optional().describe("Override default room mode (bridge or direct)"),
-        wait_seconds: z.number().int().min(0).max(300).optional().describe("Max seconds to wait before returning async job_id"),
+        wait_seconds: z.number().int().min(0).max(300).optional().describe("Max seconds to wait before returning async job_id (default 60)"),
       },
     },
     async (args) => {
@@ -91,15 +91,20 @@ export function createLingerMcpServer(client: LingerClient, jobs: JobManager): M
   server.registerTool(
     "linger_get_reply",
     {
-      description: "Poll an active or pending-approval Linger job for new replies, pending decision cards, or final completion.",
+      description:
+        "Poll an active or pending-approval Linger job for new replies, auto-inlined documents, pending decision cards, or completion. Set wait_for_followup=true on a completed job when waiting for a follow-up async delivery from the agent.",
       inputSchema: {
         job_id: z.string().min(1).describe("Job ID returned by linger_ask_agent"),
-        wait_seconds: z.number().int().min(0).max(300).optional().describe("Max seconds to wait during this poll"),
+        wait_seconds: z.number().int().min(0).max(300).optional().describe("Max seconds to wait during this poll (default 60)"),
+        wait_for_followup: z
+          .boolean()
+          .optional()
+          .describe("Set true to wait for follow-up messages/documents on an already completed job"),
       },
     },
     async (args) => {
       try {
-        const snapshot = await jobs.waitForJob(args.job_id, args.wait_seconds);
+        const snapshot = await jobs.waitForJob(args.job_id, args.wait_seconds, args.wait_for_followup ?? false);
         return jsonResult(snapshot);
       } catch (err) {
         return errorResult(err);
@@ -164,9 +169,39 @@ export function createLingerMcpServer(client: LingerClient, jobs: JobManager): M
   );
 
   server.registerTool(
+    "linger_read_document",
+    {
+      description:
+        "Read full or paginated UTF-8 content of a Linger document/file card (from snapshot.documents, reply segments, or linger_read_room), or save binary/large files locally via save_to_file=true. Prefer this over asking the Linger agent to paste full text into chat.",
+      inputSchema: {
+        document_id: z.string().min(1).describe("Document ID referenced by a Linger document card or attachment"),
+        document_version_id: z.string().min(1).optional().describe("Optional immutable Document Version ID"),
+        offset: z.number().int().min(0).optional().describe("Character offset for paginated reads (default 0)"),
+        max_chars: z.number().int().min(256).max(200_000).optional().describe("Max characters to return in one call"),
+        save_to_file: z.boolean().optional().describe("Save the downloaded document locally with 0600 permissions and return saved_path"),
+      },
+    },
+    async (args) => {
+      try {
+        const result = await jobs.readDocument({
+          documentId: args.document_id,
+          documentVersionId: args.document_version_id,
+          offset: args.offset,
+          maxChars: args.max_chars,
+          saveToFile: args.save_to_file,
+        });
+        return jsonResult(result);
+      } catch (err) {
+        return errorResult(err);
+      }
+    }
+  );
+
+  server.registerTool(
     "linger_read_room",
     {
-      description: "Read recent messages and any decision cards from a Linger room.",
+      description:
+        "Read recent messages, document references, and any decision cards from a Linger room. To read the full content of a referenced document_id, call linger_read_document.",
       inputSchema: {
         room_id: z.string().min(1).describe("Room ID"),
         limit: z.number().int().min(1).max(200).optional().describe("Number of messages to read (default 20)"),

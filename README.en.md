@@ -4,7 +4,7 @@
 
 **A stdio MCP server enabling Codex agents to orchestrate Linger agents via TeamHub Public API with async job polling and tiered approval guardrails.**
 
-[![Version v0.1.0](https://img.shields.io/badge/Version-v0.1.0-0969DA?style=flat-square)](https://github.com/Liuji860/linger-mcp/releases/tag/v0.1.0)
+[![Version v0.1.1](https://img.shields.io/badge/Version-v0.1.1-0969DA?style=flat-square)](https://github.com/Liuji860/linger-mcp/releases/tag/v0.1.1)
 ![Node >= 22](https://img.shields.io/badge/Node-%3E%3D22.0.0-339933?style=flat-square&logo=node.js&logoColor=white)
 ![TypeScript 5.8](https://img.shields.io/badge/TypeScript-5.8-3178C6?style=flat-square&logo=typescript&logoColor=white)
 ![MCP Stdio Server](https://img.shields.io/badge/MCP-Stdio%20Server-111315?style=flat-square)
@@ -126,7 +126,11 @@ sequenceDiagram
     end
   end
   A->>T: agent_run.status_changed (completed / aborted)
-  M-->>C: Aggregate reply text, attachments, and auto-approval audit log
+  opt Reply references Linger document cards or attachments
+    M->>T: GET /v0/documents/{id} & /downloads
+    T-->>M: Export Markdown/text body (auto-inlined up to 32KB)
+  end
+  M-->>C: Aggregate reply text, inlined documents, and auto-approval audit log
 ```
 
 ---
@@ -186,8 +190,9 @@ LINGER_APPROVAL_MODE = "tiered"
 | Tool | Purpose |
 | --- | --- |
 | `linger_list_agents` | List Linger agents, descriptions, models, and online/active status |
-| `linger_ask_agent` | Send a prompt to trigger an Agent Run; returns `job_id` if still running past the wait window |
-| `linger_get_reply` | Poll job status and return intermediate updates, pending decision cards, or the final result |
+| `linger_ask_agent` | Send a prompt to trigger an Agent Run (default `60s` wait) and auto-inline small/medium text or Markdown document cards |
+| `linger_get_reply` | Poll job status (supports `wait_for_followup=true` for async follow-up deliveries on completed jobs), inlined docs, or pending cards |
+| `linger_read_document` | Read/paginate full UTF-8 content by `document_id` or save large/binary files locally (`0600`) |
 | `linger_decide_card` | Validate policy constraints and call `POST /v0/decisions/{id}` with `expected_version` concurrency protection |
 | `linger_list_rooms` | List accessible Linger rooms |
 | `linger_read_room` | Read recent message context from a target room |
@@ -203,10 +208,15 @@ LINGER_APPROVAL_MODE = "tiered"
 | `LINGER_EMAIL` / `LINGER_PASSWORD` / `LINGER_KEYCHAIN_SERVICE` | Auth credentials | Account email and password (`LINGER_KEYCHAIN_SERVICE` is preferred on macOS over plaintext password) |
 | `LINGER_LOCAL_IDENTITY_KEY` / `LINGER_LOCAL_IDENTITY_ORIGIN` | Optional | 32-byte Base64 key and Web Origin for validating `POST /v0/local/identity` on local setups |
 | `LINGER_ROOM_MODE` | `bridge` | Room mode: `bridge` (dedicated `Codex Bridge` group room) or `direct` (1v1 direct chat) |
+| `LINGER_DEFAULT_WAIT_SECONDS` | `60` | Default wait timeout in seconds per call (`0..300`) |
+| `LINGER_AUTO_INLINE_DOCUMENTS` | `true` | Automatically fetch and inline text/Markdown document cards returned in replies |
+| `LINGER_INLINE_DOCUMENT_MAX_CHARS` | `32768` | Maximum characters to inline per document or return per `linger_read_document` page |
+| `LINGER_DOC_MAX_BYTES` | `10485760` | Maximum download byte limit per document (10 MiB) |
+| `LINGER_DOWNLOAD_DIR` | `<tmpdir>/linger-mcp-downloads` | Target `0700` directory when `linger_read_document` runs with `save_to_file=true` |
 | `LINGER_APPROVAL_MODE` | `tiered` | Approval policy mode: `tiered` \| `relay` \| `manual` |
-| `LINGER_APPROVAL_ALLOW_TOOLS` | Empty | Comma-separated allowlist of read-only tool names eligible for auto-approval |
-| `LINGER_APPROVAL_ALLOW_CMD_PREFIXES` | Empty | Comma-separated allowlist of safe command prefixes |
-| `LINGER_APPROVAL_DENY_PATTERNS` | Empty | Extra regex deny patterns (JSON array format recommended, e.g. `["pattern1","pattern2"]`) |
+| `LINGER_APPROVAL_ALLOW_TOOLS` | Preset read-only tools | Comma-separated allowlist of read-only tool names eligible for auto-approval |
+| `LINGER_APPROVAL_ALLOW_CMD_PREFIXES` | Preset safe prefixes | Comma-separated allowlist of safe command prefixes |
+| `LINGER_APPROVAL_DENY_PATTERNS` | Built-in dangerous rules | Extra regex deny patterns (JSON array format recommended, e.g. `["pattern1","pattern2"]`) |
 | `LINGER_ALLOW_GUI_APPROVAL` | `false` | Whether whitelisted GUI actions may be auto-approved |
 | `LINGER_ALLOW_HUMAN_CONFIRMED_RELAY` | `true` in `relay`, `false` in `tiered` | Whether high-risk cards may be relayed via MCP when `human_confirmed=true` |
 | `LINGER_MAX_CONCURRENCY` | `2` | Maximum concurrent runs to avoid local model contention |

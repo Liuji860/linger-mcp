@@ -1,6 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { evaluateDecisionCard, validateManualDecision } from "./approval-policy.js";
 import { LingerApiError, LingerClient } from "./client.js";
+import {
+  extractMessageDocumentRefs,
+  extractMessageHtmlFragments,
+  hydrateReplyDocuments,
+  readDocument,
+} from "./documents.js";
 import type {
   ApprovalEvaluation,
   DecisionAnswerAction,
@@ -11,6 +17,9 @@ import type {
   MessageAttachment,
   MessageSegment,
   PendingCardInfo,
+  ReplyDocumentRef,
+  ReplyDocumentSummary,
+  ReplyHtmlFragment,
   RoomEventEnvelope,
   RoomMode,
   RoomRunStatus,
@@ -68,6 +77,7 @@ export interface JobResultSnapshot {
   job_id: string;
   status: JobRecord["status"];
   room_id: string;
+  cursor_seq: number;
   agent_actor_id: string;
   agent_name: string;
   run_id?: string;
@@ -80,9 +90,13 @@ export interface JobResultSnapshot {
     created_at: string;
     text: string;
     attachments: MessageAttachment[];
+    documents: ReplyDocumentRef[];
+    html_fragments: ReplyHtmlFragment[];
   }>;
+  documents: ReplyDocumentSummary[];
   pending_cards: PendingCardInfo[];
   auto_approvals: JobRecord["autoApprovals"];
+  hint?: string;
 }
 
 export class JobManager {
@@ -181,9 +195,14 @@ export class JobManager {
     return count;
   }
 
-  private hasActiveJobForAgentInRoom(roomId: string, agentActorId: string): boolean {
+  private hasActiveJobForAgentInRoom(
+    roomId: string,
+    agentActorId: string,
+    excludeJobId?: string
+  ): boolean {
     for (const job of this.jobs.values()) {
       if (
+        job.id !== excludeJobId &&
         job.roomId === roomId &&
         job.agentActorId === agentActorId &&
         (job.status === "running" || job.status === "pending_approval")
@@ -272,6 +291,7 @@ export class JobManager {
         replyMessageIds: new Set(),
         cardsByMessageId: new Map(),
         processedCardVersions: new Map(),
+        hydratedDocuments: new Map(),
         autoApprovals: [],
         createdAt: nowIso,
         updatedAt: nowIso,
@@ -289,19 +309,37 @@ export class JobManager {
     return this.waitForJob(job.id, waitSeconds);
   }
 
-  async waitForJob(jobId: string, waitSeconds?: number): Promise<JobResultSnapshot> {
+  async waitForJob(
+    jobId: string,
+    waitSeconds?: number,
+    waitForFollowup: boolean = false
+  ): Promise<JobResultSnapshot> {
     return this.withJobLock(jobId, async () => {
       const job = this.jobs.get(jobId);
       if (!job) {
         throw new Error(`Unknown job_id "${jobId}"`);
       }
 
-      if (job.status === "completed" || job.status === "aborted") {
+      if (job.status === "aborted") {
         return this.toSnapshot(job);
       }
 
-      const waitMs = Math.max(0, (waitSeconds ?? this.config.defaultWaitSeconds) * 1000);
+      const wasCompleted = job.status === "completed";
+      if (wasCompleted && this.hasActiveJobForAgentInRoom(job.roomId, job.agentActorId, job.id)) {
+        if (waitForFollowup) {
+          throw new Error(
+            `Cannot wait for follow-up on "${job.id}" because another active job is currently running for "${job.agentName}" in room "${job.roomId}".`
+          );
+        }
+        return this.toSnapshot(job);
+      }
+
+      const waitMs =
+        wasCompleted && !waitForFollowup
+          ? 0
+          : Math.max(0, (waitSeconds ?? this.config.defaultWaitSeconds) * 1000);
       const deadline = Date.now() + waitMs;
+      const initialReplyCount = job.replies.length;
 
       do {
         await this.drainRoomEvents(job);
@@ -314,14 +352,22 @@ export class JobManager {
           return this.toSnapshot(job);
         }
 
-        const pendingCards = this.collectPendingCards(job);
-        if (pendingCards.length > 0) {
+        if (this.collectPendingCards(job).length > 0) {
           job.status = "pending_approval";
           job.updatedAt = new Date().toISOString();
           return this.toSnapshot(job);
         }
 
-        if (job.runStatus === "completed") {
+        if (wasCompleted) {
+          if (!waitForFollowup) {
+            break;
+          }
+          if (job.replies.length > initialReplyCount && job.runStatus !== "active") {
+            job.status = "completed";
+            job.updatedAt = new Date().toISOString();
+            return this.toSnapshot(job);
+          }
+        } else if (job.runStatus === "completed") {
           job.status = "completed";
           job.updatedAt = new Date().toISOString();
           this.pruneTerminalJobs();
@@ -335,7 +381,7 @@ export class JobManager {
         await sleep(Math.min(this.config.pollIntervalMs, remainingMs));
       } while (Date.now() < deadline);
 
-      job.status = "running";
+      job.status = wasCompleted && job.runStatus !== "active" ? "completed" : "running";
       job.updatedAt = new Date().toISOString();
       return this.toSnapshot(job);
     });
@@ -672,18 +718,64 @@ export class JobManager {
     });
   }
 
-  private toSnapshot(job: JobRecord): JobResultSnapshot {
-    const replies = job.replies.map((msg) => ({
-      message_id: msg.id,
-      created_at: msg.created_at,
-      text: msg.raw_message,
-      attachments: msg.attachments,
-    }));
+  async readDocument(input: {
+    documentId: string;
+    documentVersionId?: string;
+    offset?: number;
+    maxChars?: number;
+    saveToFile?: boolean;
+  }): Promise<Record<string, unknown>> {
+    return readDocument(this.client, this.config, input);
+  }
+
+  private async toSnapshot(job: JobRecord): Promise<JobResultSnapshot> {
+    const mergedRefs = new Map<string, ReplyDocumentRef>();
+    const replies = job.replies.map((msg) => {
+      const docs = extractMessageDocumentRefs(msg);
+      for (const ref of docs) {
+        const existing = mergedRefs.get(ref.document_id);
+        mergedRefs.set(
+          ref.document_id,
+          existing
+            ? {
+                ...existing,
+                document_version_id: existing.document_version_id ?? ref.document_version_id,
+                presentation: existing.presentation ?? ref.presentation,
+                filename: existing.filename ?? ref.filename,
+                media_type: existing.media_type ?? ref.media_type,
+                size_bytes: existing.size_bytes ?? ref.size_bytes,
+                title: existing.title || ref.title,
+              }
+            : ref
+        );
+      }
+      return {
+        message_id: msg.id,
+        created_at: msg.created_at,
+        text: msg.raw_message,
+        attachments: msg.attachments,
+        documents: docs,
+        html_fragments: extractMessageHtmlFragments(msg, this.config.inlineDocumentMaxChars),
+      };
+    });
+
+    const hydratedCache = (job.hydratedDocuments ??= new Map());
+    const documents = await hydrateReplyDocuments(
+      this.client,
+      this.config,
+      [...mergedRefs.values()],
+      hydratedCache
+    );
+
+    const needsManualRead = documents.some(
+      (doc) => doc.status === "truncated" || doc.status === "binary" || doc.status === "skipped"
+    );
 
     return {
       job_id: job.id,
       status: job.status,
       room_id: job.roomId,
+      cursor_seq: job.cursorSeq,
       agent_actor_id: job.agentActorId,
       agent_name: job.agentName,
       run_id: job.runId,
@@ -692,8 +784,14 @@ export class JobManager {
       stop_reason: job.stopReason,
       reply_text: replies.map((r) => r.text).join("\n\n"),
       replies,
+      documents,
       pending_cards: this.collectPendingCards(job),
       auto_approvals: [...job.autoApprovals],
+      ...(needsManualRead
+        ? {
+            hint: "Some documents are truncated, skipped, or binary. Call linger_read_document(document_id, ...) to paginate text or save binary files locally.",
+          }
+        : {}),
     };
   }
 }
