@@ -4,6 +4,7 @@
 
 **让 Codex Agent 通过 stdio MCP 无缝调度 Linger 全套角色，将长耗时异步任务与分级审批策略收口成安全可控的工具层。**
 
+[![Version v0.1.0](https://img.shields.io/badge/Version-v0.1.0-0969DA?style=flat-square)](https://github.com/Liuji860/linger-mcp/releases/tag/v0.1.0)
 ![Node >= 22](https://img.shields.io/badge/Node-%3E%3D22.0.0-339933?style=flat-square&logo=node.js&logoColor=white)
 ![TypeScript 5.8](https://img.shields.io/badge/TypeScript-5.8-3178C6?style=flat-square&logo=typescript&logoColor=white)
 ![MCP Stdio Server](https://img.shields.io/badge/MCP-Stdio%20Server-111315?style=flat-square)

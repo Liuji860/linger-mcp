@@ -4,6 +4,7 @@
 
 **A stdio MCP server enabling Codex agents to orchestrate Linger agents via TeamHub Public API with async job polling and tiered approval guardrails.**
 
+[![Version v0.1.0](https://img.shields.io/badge/Version-v0.1.0-0969DA?style=flat-square)](https://github.com/Liuji860/linger-mcp/releases/tag/v0.1.0)
 ![Node >= 22](https://img.shields.io/badge/Node-%3E%3D22.0.0-339933?style=flat-square&logo=node.js&logoColor=white)
 ![TypeScript 5.8](https://img.shields.io/badge/TypeScript-5.8-3178C6?style=flat-square&logo=typescript&logoColor=white)
 ![MCP Stdio Server](https://img.shields.io/badge/MCP-Stdio%20Server-111315?style=flat-square)
