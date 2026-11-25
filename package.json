@@ -1,6 +1,6 @@
 {
   "name": "linger-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Stdio MCP server allowing Codex agents to invoke Linger agents via TeamHub Public API with tiered approval policy",
   "license": "MIT",
   "private": true,

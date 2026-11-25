@@ -4,7 +4,7 @@
 
 **让 Codex Agent 通过 stdio MCP 无缝调度 Linger 全套角色，将长耗时异步任务与分级审批策略收口成安全可控的工具层。**
 
-[![Version v0.1.0](https://img.shields.io/badge/Version-v0.1.0-0969DA?style=flat-square)](https://github.com/Liuji860/linger-mcp/releases/tag/v0.1.0)
+[![Version v0.1.1](https://img.shields.io/badge/Version-v0.1.1-0969DA?style=flat-square)](https://github.com/Liuji860/linger-mcp/releases/tag/v0.1.1)
 ![Node >= 22](https://img.shields.io/badge/Node-%3E%3D22.0.0-339933?style=flat-square&logo=node.js&logoColor=white)
 ![TypeScript 5.8](https://img.shields.io/badge/TypeScript-5.8-3178C6?style=flat-square&logo=typescript&logoColor=white)
 ![MCP Stdio Server](https://img.shields.io/badge/MCP-Stdio%20Server-111315?style=flat-square)
@@ -126,7 +126,11 @@ sequenceDiagram
     end
   end
   A->>T: agent_run.status_changed (completed / aborted)
-  M-->>C: 合并回复文本、附件与自动审批审计记录
+  opt 回复包含 Linger 文档卡片或附件
+    M->>T: GET /v0/documents/{id} & /downloads
+    T-->>M: 导出 Markdown/文本正文 (<=32KB 自动内联)
+  end
+  M-->>C: 合并回复文本、内联文档正文与自动审批审计记录
 ```
 
 ---
@@ -186,8 +190,9 @@ LINGER_APPROVAL_MODE = "tiered"
 | 工具名 | 用途 |
 | --- | --- |
 | `linger_list_agents` | 列出 Linger 中的角色、描述、模型与在线状态 |
-| `linger_ask_agent` | 向指定角色发消息触发 Run，超时未结束则返回 `job_id` |
-| `linger_get_reply` | 继续轮询任务状态，返回新回复、挂起审批卡或最终结果 |
+| `linger_ask_agent` | 向指定角色发消息触发 Run（默认等待 `60s`），自动内联回复中的中小文本/Markdown 文档卡片正文 |
+| `linger_get_reply` | 轮询任务状态（支持 `wait_for_followup=true` 等待已完成任务后续异步投递的结果），返回新回复、内联文档与挂起审批卡 |
+| `linger_read_document` | 读取/分页查看指定 `document_id` 完整正文，或将大文件/二进制附件落盘到本地（`0600`） |
 | `linger_decide_card` | 按策略校验并发起 `POST /v0/decisions/{id}`（含 `expected_version` 并发保护） |
 | `linger_list_rooms` | 查看当前可见的 Room 列表 |
 | `linger_read_room` | 读取指定 Room 的历史与最新消息上下文 |
@@ -203,10 +208,15 @@ LINGER_APPROVAL_MODE = "tiered"
 | `LINGER_EMAIL` / `LINGER_PASSWORD` / `LINGER_KEYCHAIN_SERVICE` | 按认证方式配置 | 登录账号与密码（推荐优先使用 `LINGER_KEYCHAIN_SERVICE` 从 macOS 钥匙串读取） |
 | `LINGER_LOCAL_IDENTITY_KEY` / `LINGER_LOCAL_IDENTITY_ORIGIN` | 可选 | 本地安装时校验 `POST /v0/local/identity` 的 32 字节 Base64 密钥与 Web Origin |
 | `LINGER_ROOM_MODE` | `bridge` | 会话房间模式：`bridge`（独立 `Codex Bridge` 群聊）或 `direct`（1v1 单聊） |
+| `LINGER_DEFAULT_WAIT_SECONDS` | `60` | 单次等待回复超时秒数（范围 `0..300`） |
+| `LINGER_AUTO_INLINE_DOCUMENTS` | `true` | 是否自动内联回复中的文本/Markdown 文档卡片正文 |
+| `LINGER_INLINE_DOCUMENT_MAX_CHARS` | `32768` | 单篇自动内联与 `linger_read_document` 分页单次最大字符数 |
+| `LINGER_DOC_MAX_BYTES` | `10485760` | 单文档下载大小上限（10 MiB） |
+| `LINGER_DOWNLOAD_DIR` | `<tmpdir>/linger-mcp-downloads` | `linger_read_document` 开启 `save_to_file=true` 时的本地保存目录（权限 `0700`） |
 | `LINGER_APPROVAL_MODE` | `tiered` | 审批策略模式：`tiered` \| `relay` \| `manual` |
-| `LINGER_APPROVAL_ALLOW_TOOLS` | 空 | 逗号分隔允许自动放行的只读工具名 |
-| `LINGER_APPROVAL_ALLOW_CMD_PREFIXES` | 空 | 逗号分隔允许自动放行的命令前缀 |
-| `LINGER_APPROVAL_DENY_PATTERNS` | 空 | 额外禁止自动放行的正则（推荐 JSON 数组格式，如 `["pattern1","pattern2"]`） |
+| `LINGER_APPROVAL_ALLOW_TOOLS` | 预设只读工具 | 逗号分隔允许自动放行的只读工具名 |
+| `LINGER_APPROVAL_ALLOW_CMD_PREFIXES` | 预设安全前缀 | 逗号分隔允许自动放行的命令前缀 |
+| `LINGER_APPROVAL_DENY_PATTERNS` | 内置高危规则 | 额外禁止自动放行的正则（推荐 JSON 数组格式，如 `["pattern1","pattern2"]`） |
 | `LINGER_ALLOW_GUI_APPROVAL` | `false` | 是否允许白名单内的 GUI 操作自动审批 |
 | `LINGER_ALLOW_HUMAN_CONFIRMED_RELAY` | `relay` 为 `true`，`tiered` 为 `false` | 是否允许在带 `human_confirmed=true` 时经由 MCP 转发高风险卡 |
 | `LINGER_MAX_CONCURRENCY` | `2` | 并发任务上限，防止本地模型资源抢占 |
