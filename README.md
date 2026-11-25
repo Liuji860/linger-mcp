@@ -2,17 +2,18 @@
 
 # linger-mcp
 
-**让 Codex Agent 通过 stdio MCP 无缝调度 Linger 全套角色，将长耗时异步任务与分级审批策略收口成安全可控的工具层。**
+**让 Codex Agent 通过 stdio MCP 无缝调度 [Linger](https://github.com/simplexai-labs/linger) 全套角色，将长耗时异步任务与分级审批策略收口成安全可控的工具层。**
 
 [![Version v0.1.1](https://img.shields.io/badge/Version-v0.1.1-0969DA?style=flat-square)](https://github.com/Liuji860/linger-mcp/releases/tag/v0.1.1)
+[![Linger Official](https://img.shields.io/badge/Linger-simplexai--labs%2Flinger-111315?style=flat-square&logo=github)](https://github.com/simplexai-labs/linger)
 ![Node >= 22](https://img.shields.io/badge/Node-%3E%3D22.0.0-339933?style=flat-square&logo=node.js&logoColor=white)
 ![TypeScript 5.8](https://img.shields.io/badge/TypeScript-5.8-3178C6?style=flat-square&logo=typescript&logoColor=white)
 ![MCP Stdio Server](https://img.shields.io/badge/MCP-Stdio%20Server-111315?style=flat-square)
-![License: MIT](https://img.shields.io/badge/License-MIT-E4482B?style=flat-square)
+[![License: MIT](https://img.shields.io/badge/License-MIT-E4482B?style=flat-square)](./LICENSE)
 
 <br />
 
-**简体中文** &nbsp;|&nbsp; [English](./README.en.md)
+**简体中文** &nbsp;|&nbsp; [English](./README.en.md) &nbsp;|&nbsp; 官方项目：[simplexai-labs/linger](https://github.com/simplexai-labs/linger)
 
 <br />
 
