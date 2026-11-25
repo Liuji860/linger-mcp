@@ -1,0 +1,490 @@
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { SessionStore, readMacOsKeychainPassword } from "./session-store.js";
+import type {
+  CurrentIdentity,
+  DecisionRequest,
+  LingerMcpConfig,
+  Message,
+  MessagePage,
+  MessageSegment,
+  Room,
+  RoomEventPage,
+  RoomListItem,
+  RoomPage,
+  RoomRunStatusList,
+  Session,
+  TenantAgent,
+  TenantAgentAvailabilityPage,
+  TenantAgentAvailabilitySnapshot,
+  TenantAgentPage,
+} from "./types.js";
+
+export class LingerApiError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly code: string,
+    message: string,
+    public readonly retryAfterSeconds?: number,
+    public readonly requestId?: string
+  ) {
+    super(message);
+    this.name = "LingerApiError";
+  }
+}
+
+interface ErrorBody {
+  error?: {
+    code?: string;
+    message?: string;
+    request_id?: string;
+  };
+}
+
+function extractSessionCookie(headers: Headers): string | null {
+  const setCookies =
+    typeof headers.getSetCookie === "function"
+      ? headers.getSetCookie()
+      : headers.get("set-cookie")
+        ? [headers.get("set-cookie") as string]
+        : [];
+
+  for (const header of setCookies) {
+    const match = /(?:^|,\s*)(teamhub_session=[^;\s]+)/.exec(header);
+    if (match?.[1]) {
+      return match[1];
+    }
+  }
+  return null;
+}
+
+export class LingerClient {
+  private cookie: string | null = null;
+  private tenantId: string | null = null;
+  private humanActorId: string | null = null;
+  private loginPromise: Promise<void> | null = null;
+
+  constructor(
+    private readonly config: LingerMcpConfig,
+    private readonly sessionStore: SessionStore
+  ) {}
+
+  getTenantId(): string | null {
+    return this.tenantId;
+  }
+
+  getHumanActorId(): string | null {
+    return this.humanActorId;
+  }
+
+  /**
+   * Verifies a local Linger installation before sending credentials when
+   * LINGER_LOCAL_IDENTITY_KEY (32-byte standard base64) is configured.
+   */
+  async verifyLocalIdentity(): Promise<void> {
+    if (!this.config.localIdentityKey) {
+      return;
+    }
+    const key = Buffer.from(this.config.localIdentityKey, "base64");
+    if (key.length !== 32) {
+      throw new Error("LINGER_LOCAL_IDENTITY_KEY must decode to exactly 32 bytes");
+    }
+    const nonce = randomBytes(32).toString("base64url");
+    const origin = new URL(this.config.baseUrl).origin;
+    const expected = createHmac("sha256", key)
+      .update(`linger-local-identity\n${nonce}\n${origin}`)
+      .digest();
+
+    const response = await this.rawFetch("/v0/local/identity", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ nonce }),
+    });
+    if (!response.ok) {
+      throw await this.buildApiError(response);
+    }
+    const data = (await response.json()) as { proof?: string };
+    if (!data.proof) {
+      throw new Error("Local identity verification returned empty proof");
+    }
+    const actual = Buffer.from(data.proof, "base64url");
+    if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) {
+      throw new Error("Local identity proof mismatch: target server is not the expected local Linger instance");
+    }
+  }
+
+  async ensureSession(): Promise<void> {
+    if (this.cookie && this.tenantId) {
+      return;
+    }
+    if (!this.loginPromise) {
+      this.loginPromise = this.resolveOrLogin().finally(() => {
+        this.loginPromise = null;
+      });
+    }
+    await this.loginPromise;
+  }
+
+  private async resolveOrLogin(): Promise<void> {
+    if (!this.cookie) {
+      const cached = await this.sessionStore.load(this.config.baseUrl);
+      if (cached) {
+        this.cookie = cached.cookie;
+        this.tenantId = cached.tenantId ?? null;
+        this.humanActorId = cached.humanActorId ?? null;
+        if (this.tenantId) {
+          return;
+        }
+        try {
+          const me = await this.fetchWithAuth<CurrentIdentity>("GET", "/v0/me");
+          const actor = me.actors[0];
+          if (actor) {
+            this.tenantId = actor.tenant_id;
+            this.humanActorId = actor.id;
+            await this.sessionStore.save({
+              ...cached,
+              tenantId: actor.tenant_id,
+              humanActorId: actor.id,
+            });
+            return;
+          }
+        } catch {
+          this.cookie = null;
+          this.tenantId = null;
+          this.humanActorId = null;
+          await this.sessionStore.clear();
+        }
+      }
+    }
+
+    await this.login();
+  }
+
+  private async login(): Promise<void> {
+    const email = this.config.email;
+    if (!email) {
+      throw new Error("LINGER_EMAIL is required when no valid cached session exists");
+    }
+
+    let password = this.config.password;
+    if (!password && this.config.keychainService) {
+      password = await readMacOsKeychainPassword(this.config.keychainService, email);
+    }
+    if (!password) {
+      throw new Error(
+        "LINGER_PASSWORD or LINGER_KEYCHAIN_SERVICE is required when no valid cached session exists"
+      );
+    }
+
+    await this.verifyLocalIdentity();
+
+    const response = await this.rawFetch("/v0/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ identifier: email, password }),
+    });
+    if (!response.ok) {
+      throw await this.buildApiError(response);
+    }
+
+    const sessionCookie = extractSessionCookie(response.headers);
+    if (!sessionCookie) {
+      throw new Error("Login succeeded but server did not return teamhub_session Set-Cookie");
+    }
+    const session = (await response.json()) as Session;
+    const actor = session.identity.actors[0];
+    if (!actor?.tenant_id) {
+      throw new Error("Login succeeded but account has no active Human Actor / Tenant");
+    }
+
+    this.cookie = sessionCookie;
+    this.tenantId = actor.tenant_id;
+    this.humanActorId = actor.id;
+
+    await this.sessionStore.save({
+      baseUrl: this.config.baseUrl,
+      cookie: sessionCookie,
+      expiresAt: session.expires_at,
+      tenantId: actor.tenant_id,
+      humanActorId: actor.id,
+    });
+  }
+
+  private async rawFetch(path: string, init: RequestInit): Promise<Response> {
+    return fetch(`${this.config.baseUrl}${path}`, {
+      ...init,
+      signal: AbortSignal.timeout(this.config.requestTimeoutMs),
+    });
+  }
+
+  private async buildApiError(response: Response): Promise<LingerApiError> {
+    const retryAfterHeader = response.headers.get("retry-after");
+    const retryAfterSeconds = retryAfterHeader ? Number.parseInt(retryAfterHeader, 10) : undefined;
+    const rawText = await response.text().catch(() => "");
+    try {
+      const parsed = JSON.parse(rawText) as ErrorBody;
+      if (parsed.error?.message) {
+        return new LingerApiError(
+          response.status,
+          parsed.error.code ?? `HTTP_${response.status}`,
+          parsed.error.message,
+          Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : undefined,
+          parsed.error.request_id
+        );
+      }
+    } catch {
+      // Fall through to status text.
+    }
+    return new LingerApiError(
+      response.status,
+      `HTTP_${response.status}`,
+      rawText || response.statusText || `HTTP ${response.status}`,
+      Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : undefined
+    );
+  }
+
+  private async fetchWithAuth<T>(
+    method: string,
+    path: string,
+    options?: { body?: unknown; headers?: Record<string, string>; rawBinary?: boolean },
+    retriedAfter401: boolean = false
+  ): Promise<T> {
+    if (!this.cookie) {
+      await this.ensureSession();
+    }
+
+    const headers: Record<string, string> = {
+      ...(options?.headers ?? {}),
+      Cookie: this.cookie as string,
+    };
+    let encodedBody: string | undefined;
+    if (options?.body !== undefined) {
+      headers["Content-Type"] = "application/json";
+      encodedBody = JSON.stringify(options.body);
+    }
+
+    const response = await this.rawFetch(path, {
+      method,
+      headers,
+      body: encodedBody,
+    });
+
+    if (response.status === 401 && !retriedAfter401) {
+      this.cookie = null;
+      this.tenantId = null;
+      this.humanActorId = null;
+      await this.sessionStore.clear();
+      await this.ensureSession();
+      return this.fetchWithAuth<T>(method, path, options, true);
+    }
+
+    if (!response.ok) {
+      throw await this.buildApiError(response);
+    }
+
+    if (response.status === 204) {
+      return undefined as T;
+    }
+
+    if (options?.rawBinary) {
+      const buffer = Buffer.from(await response.arrayBuffer());
+      return {
+        mimeType: response.headers.get("content-type") ?? "application/octet-stream",
+        base64: buffer.toString("base64"),
+      } as T;
+    }
+
+    return (await response.json()) as T;
+  }
+
+  private async requireTenantId(): Promise<string> {
+    await this.ensureSession();
+    if (!this.tenantId) {
+      throw new Error("Unable to determine Tenant ID for authenticated Linger account");
+    }
+    return this.tenantId;
+  }
+
+  async listAgents(): Promise<TenantAgent[]> {
+    const tenantId = await this.requireTenantId();
+    const items: TenantAgent[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 10; page++) {
+      const qs = new URLSearchParams({ limit: "200" });
+      if (cursor) {
+        qs.set("cursor", cursor);
+      }
+      const res = await this.fetchWithAuth<TenantAgentPage>("GET", `/v0/tenants/${encodeURIComponent(tenantId)}/agents?${qs}`);
+      items.push(...res.items);
+      if (!res.page.has_more || !res.page.next_cursor) {
+        break;
+      }
+      cursor = res.page.next_cursor;
+    }
+    return items;
+  }
+
+  async listAgentAvailability(): Promise<TenantAgentAvailabilitySnapshot[]> {
+    const tenantId = await this.requireTenantId();
+    const items: TenantAgentAvailabilitySnapshot[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 10; page++) {
+      const qs = new URLSearchParams({ limit: "200" });
+      if (cursor) {
+        qs.set("cursor", cursor);
+      }
+      const res = await this.fetchWithAuth<TenantAgentAvailabilityPage>(
+        "GET",
+        `/v0/tenants/${encodeURIComponent(tenantId)}/agent-availability?${qs}`
+      );
+      items.push(...res.items);
+      if (!res.page.has_more || !res.page.next_cursor) {
+        break;
+      }
+      cursor = res.page.next_cursor;
+    }
+    return items;
+  }
+
+  async listRooms(limit: number = 50): Promise<RoomListItem[]> {
+    const tenantId = await this.requireTenantId();
+    const bounded = Math.max(1, Math.min(200, limit));
+    const items: RoomListItem[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < 5; page++) {
+      const qs = new URLSearchParams({ limit: String(bounded) });
+      if (cursor) {
+        qs.set("cursor", cursor);
+      }
+      const res = await this.fetchWithAuth<RoomPage>("GET", `/v0/tenants/${encodeURIComponent(tenantId)}/rooms?${qs}`);
+      items.push(...res.items);
+      if (!res.page.has_more || !res.page.next_cursor || items.length >= bounded) {
+        break;
+      }
+      cursor = res.page.next_cursor;
+    }
+    return items.slice(0, bounded);
+  }
+
+  async createRoom(name: string, description?: string): Promise<Room> {
+    const tenantId = await this.requireTenantId();
+    return this.fetchWithAuth<Room>("POST", `/v0/tenants/${encodeURIComponent(tenantId)}/rooms`, {
+      body: description ? { name, description } : { name },
+    });
+  }
+
+  async openDirectRoom(peerActorId: string): Promise<Room> {
+    const tenantId = await this.requireTenantId();
+    return this.fetchWithAuth<Room>("POST", `/v0/tenants/${encodeURIComponent(tenantId)}/direct-rooms`, {
+      body: { peer_actor_id: peerActorId },
+    });
+  }
+
+  async ensureBridgeRoom(roomName: string): Promise<Room> {
+    const existing = await this.listRooms(200);
+    const match = existing.find((room) => room.kind === "room" && room.name === roomName);
+    if (match) {
+      return match;
+    }
+    try {
+      return await this.createRoom(roomName, "Bridge room for Codex MCP agent calls");
+    } catch (err) {
+      if (err instanceof LingerApiError && err.status === 409 && err.code === "ROOM_NAME_TAKEN") {
+        const refreshed = await this.listRooms(200);
+        const found = refreshed.find((room) => room.kind === "room" && room.name === roomName);
+        if (found) {
+          return found;
+        }
+      }
+      throw err;
+    }
+  }
+
+  async getRoom(roomId: string): Promise<Room> {
+    return this.fetchWithAuth<Room>("GET", `/v0/rooms/${encodeURIComponent(roomId)}`);
+  }
+
+  async sendMessage(roomId: string, segments: MessageSegment[], idempotencyKey?: string): Promise<Message> {
+    if (segments.length === 0) {
+      throw new Error("Message must include at least one segment");
+    }
+    // TeamHub strictly validates that raw_message equals concatenated segment contents.
+    const rawMessage = segments.map((segment) => segment.content).join("");
+    if (!rawMessage.trim()) {
+      throw new Error("Message raw_message must not be blank");
+    }
+    const key = idempotencyKey ?? `mcp-${randomUUID()}`;
+    return this.fetchWithAuth<Message>("POST", `/v0/rooms/${encodeURIComponent(roomId)}/messages`, {
+      headers: { "Idempotency-Key": key },
+      body: { raw_message: rawMessage, segments },
+    });
+  }
+
+  async listMessages(roomId: string, limit: number = 20, cursor?: string): Promise<MessagePage> {
+    const qs = new URLSearchParams({ limit: String(Math.max(1, Math.min(200, limit))) });
+    if (cursor) {
+      qs.set("cursor", cursor);
+    }
+    return this.fetchWithAuth<MessagePage>("GET", `/v0/rooms/${encodeURIComponent(roomId)}/messages?${qs}`);
+  }
+
+  async getMessage(roomId: string, messageId: string): Promise<Message> {
+    return this.fetchWithAuth<Message>(
+      "GET",
+      `/v0/rooms/${encodeURIComponent(roomId)}/messages/${encodeURIComponent(messageId)}`
+    );
+  }
+
+  async listRoomEvents(roomId: string, afterSeq: number = 0, limit: number = 200): Promise<RoomEventPage> {
+    const qs = new URLSearchParams({
+      after: String(Math.max(0, afterSeq)),
+      limit: String(Math.max(1, Math.min(200, limit))),
+    });
+    return this.fetchWithAuth<RoomEventPage>("GET", `/v0/rooms/${encodeURIComponent(roomId)}/events?${qs}`);
+  }
+
+  async listRunStatuses(roomId: string): Promise<RoomRunStatusList> {
+    return this.fetchWithAuth<RoomRunStatusList>("GET", `/v0/rooms/${encodeURIComponent(roomId)}/run-statuses`);
+  }
+
+  async cancelRun(roomId: string, runId: string, reason?: string): Promise<unknown> {
+    return this.fetchWithAuth<unknown>(
+      "POST",
+      `/v0/rooms/${encodeURIComponent(roomId)}/runs/${encodeURIComponent(runId)}/cancel`,
+      { body: reason ? { reason } : {} }
+    );
+  }
+
+  async decideDecision(decisionId: string, request: DecisionRequest): Promise<Message> {
+    if (!Number.isInteger(request.expected_version) || request.expected_version < 1) {
+      throw new Error("expected_version must be an integer >= 1");
+    }
+    // TeamHub typedcard/decisions.go rejects approve requests that carry a comment.
+    if (request.decision === "approve" && request.comment !== undefined && request.comment.trim() !== "") {
+      throw new Error("TeamHub does not allow comment when decision is approve");
+    }
+    const payload: DecisionRequest = {
+      expected_version: request.expected_version,
+      decision: request.decision,
+    };
+    if (request.comment && request.comment.trim() !== "") {
+      payload.comment = request.comment.trim();
+    }
+    if (request.connection_id) {
+      payload.connection_id = request.connection_id;
+    }
+    if (request.answers) {
+      payload.answers = request.answers;
+    }
+    return this.fetchWithAuth<Message>("POST", `/v0/decisions/${encodeURIComponent(decisionId)}`, {
+      body: payload,
+    });
+  }
+
+  async getDecisionScreenshot(decisionId: string): Promise<{ mimeType: string; base64: string }> {
+    return this.fetchWithAuth<{ mimeType: string; base64: string }>(
+      "GET",
+      `/v0/decisions/${encodeURIComponent(decisionId)}/screenshot`,
+      { rawBinary: true }
+    );
+  }
+}
